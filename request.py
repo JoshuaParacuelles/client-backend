@@ -10,7 +10,7 @@ from flask_cors import CORS
 from supabase_client import supabase
 
 app = Flask(__name__)
-CORS(app)
+CORS(app, origins=["https://client-ov0j76xwg-joshua-paracuelles-projects.vercel.app"])
 
 BUCKET = "signatures"
 MAX_SIG_BYTES = 2 * 1024 * 1024
