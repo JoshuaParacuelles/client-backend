@@ -49,6 +49,24 @@ COMMON = ["num_copies", "purposes", "form_type",
           "signature_printed_name"]  # NEW: was missing, so it was always dropped before saving
 ALWAYS_REQUIRED = ["requester_name", "requester_relationship", "requester_address"]
 
+# ── STATUS TRACKING (used by the public /api/track lookup below) ──────
+# Kept in sync with routes/citizen_requests.py in the main (admin)
+# backend, which is the ONLY place that ever writes a new status. This
+# file only reads it back for the citizen-facing tracker.
+STATUS_ORDER = ["PENDING", "PROCESSING", "READY_FOR_PICKUP", "COMPLETED"]
+STATUS_LABELS = {
+    "PENDING": "Pending Review",
+    "PROCESSING": "Being Processed",
+    "READY_FOR_PICKUP": "Ready for Pickup",
+    "COMPLETED": "Completed",
+    "REJECTED": "Rejected",
+}
+
+# NOTE (migration): assumes civil_registry_request has an
+# `updated_at timestamptz` column (nullable is fine). If it doesn't
+# exist yet, add it:
+#   ALTER TABLE civil_registry_request ADD COLUMN updated_at timestamptz;
+
 
 def clean(v):
     """Trim strings; empty string -> None (Postgres rejects '' for date columns)."""
@@ -204,6 +222,57 @@ def death_submit():
 @app.post("/api/marriage/submit")
 def marriage_submit():
     return submit("marriage")
+
+
+# ── PUBLIC TRACKING (NEW) ─────────────────────────────────────
+@app.get("/api/track/<string:control_no>")
+def track_request(control_no):
+    """
+    Public lookup — no auth. A citizen who submitted a request has their
+    control number (returned at submission time) and can check its status
+    without logging in. Only status/progress info is returned — never
+    address, telephone, or signature data.
+
+    The status here is only ever CHANGED by the main admin backend's
+    routes/citizen_requests.py (session-gated, staff-only); this endpoint
+    only reads whatever value is currently on the row.
+    """
+    control_no = (control_no or "").strip().upper()
+    if not control_no:
+        return jsonify({"error": "Control number is required."}), 400
+
+    try:
+        rows = supabase.table(REQUEST_TABLE).select(
+            "id, record_type, control_no, status, created_at, updated_at, "
+            "requester_name, num_copies, "
+            "child_firstname, child_surname, "
+            "deceased_firstname, deceased_surname, "
+            "husband_fullname, wife_maiden_name"
+        ).eq("control_no", control_no).limit(1).execute().data
+
+        if not rows:
+            return jsonify({"error": "No request found with that control number."}), 404
+
+        row = rows[0]
+        kind = (row.get("record_type") or "birth").lower()
+        status = (row.get("status") or "PENDING").upper()
+
+        return jsonify({
+            "control_no": row.get("control_no"),
+            "record_type": kind,
+            "subject": who(kind, row),
+            "requester_name": row.get("requester_name"),
+            "num_copies": row.get("num_copies"),
+            "status": status,
+            "status_label": STATUS_LABELS.get(status, status),
+            "is_rejected": status == "REJECTED",
+            "submitted_at": row.get("created_at"),
+            "updated_at": row.get("updated_at"),
+            "steps": STATUS_ORDER,
+            "current_step_index": STATUS_ORDER.index(status) if status in STATUS_ORDER else -1,
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 
 # ── Signature image ──────────────────────────────────────────
