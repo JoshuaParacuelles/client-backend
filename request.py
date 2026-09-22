@@ -45,8 +45,11 @@ KINDS = {
 }
 COMMON = ["num_copies", "purposes", "form_type",
           "requester_name", "requester_relationship", "requester_address", "requester_telephone",
+          "requester_email",  # NEW: was missing, so the client's Gmail was collected on the
+                               # form but silently dropped before saving. Required so status
+                               # updates have an address to email the citizen at.
           "registry_no", "date_of_registration", "book", "page", "search_by",
-          "signature_printed_name"]  # NEW: was missing, so it was always dropped before saving
+          "signature_printed_name"]
 ALWAYS_REQUIRED = ["requester_name", "requester_relationship", "requester_address"]
 
 # ── STATUS TRACKING (used by the public /api/track lookup below) ──────
