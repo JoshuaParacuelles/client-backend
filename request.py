@@ -52,15 +52,11 @@ COMMON = ["num_copies", "purposes", "form_type",
           "signature_printed_name"]
 ALWAYS_REQUIRED = ["requester_name", "requester_relationship", "requester_address"]
 
-# ── STATUS TRACKING (used by the public /api/track lookup below) ──────
-# Kept in sync with routes/citizen_requests.py in the main (admin)
-# backend, which is the ONLY place that ever writes a new status. This
-# file only reads it back for the citizen-facing tracker.
-STATUS_ORDER = ["PENDING", "PROCESSING", "READY_FOR_PICKUP", "COMPLETED"]
+
+STATUS_ORDER = ["PENDING", "PROCESSING", "COMPLETED"]
 STATUS_LABELS = {
     "PENDING": "Pending Review",
     "PROCESSING": "Being Processed",
-    "READY_FOR_PICKUP": "Ready for Pickup",
     "COMPLETED": "Completed",
     "REJECTED": "Rejected",
 }
