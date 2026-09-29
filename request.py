@@ -125,6 +125,45 @@ def who(kind, r):
     return f"{r.get(p + '_firstname') or ''} {r.get(p + '_surname') or ''}".strip()
 
 
+def create_request_notification(supabase, row):
+    """Insert an admin-bell notification for a newly submitted request."""
+    try:
+        kind = (row.get("record_type") or "").lower()
+        if kind not in ("birth", "death", "marriage"):
+            return None
+
+        if kind == "marriage":
+            subject = f"{row.get('husband_fullname') or ''} & {row.get('wife_maiden_name') or ''}".strip()
+        else:
+            p = "child" if kind == "birth" else "deceased"
+            subject = f"{row.get(p + '_firstname') or ''} {row.get(p + '_surname') or ''}".strip()
+
+        control_no = row.get("control_no")
+        requester = row.get("requester_name") or "a citizen"
+
+        supabase.table("notification").insert({
+            "record_type": kind,
+            "record_id": row.get("id"),
+            "control_no": control_no,
+            "title": f"New {kind.title()} Certificate Request",
+            "message": f"New {kind} certificate request (Control No: {control_no}) "
+                       f"for {subject or 'N/A'} from {requester}.",
+            "request_snapshot": {
+                "request_id": row.get("id"),
+                "control_no": control_no,
+                "record_type": kind,
+                "requester_name": row.get("requester_name"),
+                "num_copies": row.get("num_copies"),
+                "purposes": row.get("purposes"),
+                "source": "online_request",
+            },
+            "is_read": False,
+        }).execute()
+    except Exception as e:
+        print(f"[request] notification insert failed (ignored): {e}")
+        return None
+
+
 def get_incoming_fields(kind):
     """
     Reads the submitted field data regardless of whether the request came in
@@ -175,17 +214,7 @@ def submit(kind):
         control_no = gen_control(cfg["prefix"], record_id)
         supabase.table(cfg["table"]).update({"control_no": control_no}).eq("id", record_id).execute()
 
-        snapshot = {**row, "record_type": kind, "control_no": control_no,
-                    "has_signature": row["signature_path"] is not None}
-        snapshot.pop("signature_path")
-        supabase.table("notification").insert({
-            "record_type": kind,
-            "record_id": record_id,
-            "control_no": control_no,
-            "title": f"New {kind.title()} Request",
-            "message": f"{kind.title()} record request for {who(kind, row)} submitted. Control No: {control_no}",
-            "request_snapshot": snapshot,
-        }).execute()
+        create_request_notification(supabase, {**row, **rec, "control_no": control_no})
 
         return jsonify({"record_id": record_id, "control_no": control_no,
                         "has_signature": row["signature_path"] is not None})
