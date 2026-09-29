@@ -278,10 +278,6 @@ def submit(kind):
     row["status"] = "PENDING"
     row["record_type"] = kind
 
-    # Explicit consent must be sent by the form (enforced server-side, not just in the UI).
-    if str(data.get("consent", "")).strip().lower() not in ("true", "1", "yes"):
-        return jsonify({"error": "Consent to the Privacy Policy is required to submit a request."}), 400
-
     missing = [f for f in cfg["required"] + ALWAYS_REQUIRED if not row.get(f)]
     if missing:
         return jsonify({"error": f"Missing required field(s): {', '.join(missing)}"}), 400
