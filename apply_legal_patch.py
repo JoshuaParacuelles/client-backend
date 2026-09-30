@@ -1,142 +1,34 @@
 #!/usr/bin/env python3
-"""Adds the form-guidance feature to the request form.
-
-Usage (from the project root):
-    python apply_guidance_patch.py --frontend client/src/component/request.jsx
-
-Every edit is applied in memory first. If ANY expected snippet is not found
-exactly once, NOTHING is written. A backup is saved as request.jsx.bak.
-Only client/src/component/request.jsx is touched (no backend, no Legal.jsx).
-"""
+"""Usage: python apply_legal_patch.py --frontend src/App.jsx --backend backend/request.py
+Applies every edit in memory first; if ANY expected snippet is not found exactly once,
+nothing is written. Backups are saved as *.bak."""
 import argparse, shutil, sys
 
-# ───────────────────────── new code blocks ─────────────────────────
+# (old, new, expected_count)  -- specific edits first, replace-all last
+FE = [
+('import { useState, useEffect, useRef } from "react";',
+ 'import { useState, useEffect, useRef } from "react";\nimport { LEGAL_CSS, LEGAL_ROUTES, LegalPage, SiteFooter, ConsentCheckbox, useHashRoute } from "./Legal";', 1),
 
-GUIDANCE_BLOCK = r'''/* ─── FORM GUIDANCE ───────────────────────────────────────────
-   Helper text, friendly messages and the progress bar. All wording lives
-   here so it can be edited without touching the form logic. */
-const REQUESTER_HINTS = {
-  requester_name: "Your own full name, as shown on your valid ID.",
-  requester_relationship: "How you are related to the person on the record. For example: Self, Mother, Spouse.",
-  requester_address: "Where you live now. Include street, barangay and city.",
-  requester_telephone: "Optional. We may call you if we need to clarify your request.",
-  requester_email: "Use an email you check often. You need it, with your control number, to track your request.",
-};
+# Checkbox glyph hidden from screen readers
+('<span className="check-box">{checked ? "✓" : ""}</span>',
+ '<span className="check-box" aria-hidden="true">{checked ? "✓" : ""}</span>', 1),
 
-const BLOCK_HELP = {
-  "Name of Child": "Write the name as it appears on the birth certificate. First name is required. Middle name and surname help us find the record faster.",
-  "Date of Birth": "Year is required. If you don't know the exact day, enter the month and year only.",
-  "Name of Deceased": "Write the name as it appears on the death certificate. First name is required. Middle name and surname help us find the record faster.",
-  "Date of Death": "Year is required. Add the month and day if you know them.",
-  "Name of Husband": "Type the husband's complete name.",
-  "Maiden Name of Wife": "Use the wife's name before marriage (her maiden surname).",
-  "Date of Marriage": "Optional. Type the full date if you know it, for example January 1, 2020.",
-};
+# Subject fields: accessible names
+('function SubjectField({ k, cls, placeholder, sub, values, setValue, errors }) {',
+ 'function SubjectField({ k, cls, placeholder, sub, heading, values, setValue, errors }) {', 1),
+('onChange={(e) => setValue(k, e.target.value)} placeholder={placeholder} />',
+ 'onChange={(e) => setValue(k, e.target.value)} placeholder={placeholder}\n        aria-label={`${heading} ${sub}`} aria-invalid={!!errors[k]} />', 1),
+('const common = { values, setValue, errors };',
+ 'const common = { values, setValue, errors, heading: block.heading };', 1),
 
-function validateRequesterField(key, value) {
-  const v = (value || "").trim();
-  switch (key) {
-    case "requester_name":
-      return v ? null : "Please type your full name.";
-    case "requester_relationship":
-      return v ? null : "Please tell us how you are related to the record owner (for example, Self or Parent).";
-    case "requester_address":
-      return v ? null : "Please type your address.";
-    case "requester_email":
-      if (!v) return "Please type your email address.";
-      return EMAIL_REGEX.test(v) ? null : "This email doesn't look right. It should look like name@example.com.";
-    case "requester_telephone":
-      return getPhoneError(value);
-    default:
-      return null;
-  }
-}
-
-function validateSubjectField(block, key, value) {
-  const v = (value || "").trim();
-  if (!v) {
-    if (!block.required.includes(key)) return null;
-    if (block.type === "name") return "Please type the first name.";
-    if (block.type === "date") return "Please type the year (4 digits).";
-    return `Please type the ${block.heading.toLowerCase()}.`;
-  }
-  if (block.type === "date") {
-    const part = block.keys.indexOf(key);
-    if (part === 2 && !/^\d{4}$/.test(v)) return "Year should be 4 digits, like 1990.";
-    if (part === 1 && !(/^\d{1,2}$/.test(v) && +v >= 1 && +v <= 31)) return "Day should be a number from 1 to 31.";
-  }
-  return null;
-}
-
-// Scrolls to a part of the form and puts the cursor in its first field.
-function goTo(selector) {
-  const el = document.querySelector(selector);
-  if (!el) return;
-  el.scrollIntoView({ behavior: "smooth", block: "start" });
-  const fieldSel = 'input:not([type="file"]):not([readonly]):not([disabled])';
-  const field = el.matches(fieldSel) ? el : (el.querySelector(fieldSel) || el.nextElementSibling?.querySelector(fieldSel));
-  field?.focus({ preventScroll: true });
-}
-
-// After a blocked submit: jump to the first field that needs fixing.
-function focusFirstError() {
-  const el = document.querySelector('.form-paper [aria-invalid="true"]');
-  if (!el) return;
-  el.scrollIntoView({ behavior: "smooth", block: "center" });
-  el.focus({ preventScroll: true });
-}
-
-function FormGuide({ steps }) {
-  const next = steps.find((s) => !s.done);
-  return (
-    <div className="guide-bar">
-      <p className="guide-lead">
-        Fill in the form from top to bottom. Fields marked <strong>*</strong> are required.
-      </p>
-      <ol className="guide-steps" aria-label="Form progress">
-        {steps.map((s, i) => (
-          <li key={s.label}>
-            <button type="button" className={`guide-step${s.done ? " done" : ""}${next === s ? " next" : ""}`}
-              aria-current={next === s ? "step" : undefined} onClick={() => goTo(s.target)}>
-              <span className="guide-dot" aria-hidden="true">{s.done ? "✓" : i + 1}</span>
-              {s.label}
-              <span className="sr-only">{s.done ? " (done)" : " (not done yet)"}</span>
-            </button>
-          </li>
-        ))}
-      </ol>
-      <p className="guide-next" role="status" aria-live="polite">
-        {next ? `Next: ${next.hint}` : "All set. Press Review Request at the bottom to check your answers."}
-      </p>
-    </div>
-  );
-}
-
-'''
-
-VALIDATE_REQUESTER_NEW = r'''function validateRequester(req) {
-  const errs = {};
-  ["requester_name", "requester_relationship", "requester_address", "requester_email", "requester_telephone"].forEach((k) => {
-    const m = validateRequesterField(k, req[k]);
-    if (m) errs[k] = m;
-  });
-  return errs;
-}'''
-
-VALIDATE_REQUESTER_OLD = r'''function validateRequester(req) {
-  const errs = {};
-  if (!req.requester_name.trim()) errs.requester_name = "Full name is required";
-  if (!req.requester_relationship.trim()) errs.requester_relationship = "Relationship is required";
-  if (!req.requester_address.trim()) errs.requester_address = "Address is required";
-  if (!req.requester_email.trim()) errs.requester_email = "Email is required";
-  else if (!EMAIL_REGEX.test(req.requester_email.trim())) errs.requester_email = "Enter a valid email address";
-  const phoneErr = getPhoneError(req.requester_telephone);
-  if (phoneErr) errs.requester_telephone = phoneErr;
-  return errs;
-}'''
-
-TEXT_FN_OLD = r'''  const text = (key, label, extra = {}) => (
-    <div>
+# Requester text fields -> real <label>
+('''    <div className="req-field">
+      {label}
+      <input type="text" className={errors[key] ? "invalid" : ""} value={data[key]}
+        onChange={(e) => onChange(key, e.target.value)} {...extra} />
+      {errors[key] && <div className="field-error">{errors[key]}</div>}
+    </div>''',
+'''    <div>
       <label className="req-field">
         {label}
         <input type="text" className={errors[key] ? "invalid" : ""} value={data[key]}
@@ -144,235 +36,176 @@ TEXT_FN_OLD = r'''  const text = (key, label, extra = {}) => (
           onChange={(e) => onChange(key, e.target.value)} {...extra} />
       </label>
       {errors[key] && <div className="field-error" role="alert">{errors[key]}</div>}
-    </div>
-  );'''
+    </div>''', 1),
 
-TEXT_FN_NEW = r'''  const text = (key, label, extra = {}) => (
-    <div>
-      <label className="req-field">
-        {label}
-        <input type="text" className={errors[key] ? "invalid" : ""} value={data[key]}
-          aria-invalid={!!errors[key]} aria-required={label.endsWith("*")}
-          aria-describedby={REQUESTER_HINTS[key] ? `hint-${key}` : undefined}
-          onChange={(e) => onChange(key, e.target.value)}
-          onBlur={() => onBlurField && onBlurField(key)} {...extra} />
-      </label>
-      {REQUESTER_HINTS[key] && <div className="field-hint" id={`hint-${key}`}>{REQUESTER_HINTS[key]}</div>}
-      {errors[key] && <div className="field-error" role="alert">{errors[key]}</div>}
-    </div>
-  );'''
+# Signature upload
+('<img src={preview} alt="signature preview" className="sig-preview" />',
+ '<img src={preview} alt="Preview of the uploaded signature file" className="sig-preview" />', 1),
+('onClick={() => { setError(""); reset(); }} title="Remove">×</button>',
+ 'onClick={() => { setError(""); reset(); }} title="Remove" aria-label="Remove uploaded signature file">×</button>', 1),
+('''      <div className="req-field">
+        Signature Over Printed Name
+        <input type="text" value={printedName} onChange={(e) => onPrintedNameChange(e.target.value)}
+          placeholder="Type the name that appears under your signature" />
+      </div>''',
+'''      <label className="req-field">
+        Signature Over Printed Name
+        <input type="text" value={printedName} onChange={(e) => onPrintedNameChange(e.target.value)}
+          placeholder="Type the name that appears under your signature" />
+      </label>''', 1),
 
-SUBJECT_RETURN_NEW = r'''  const help = BLOCK_HELP[block.heading];
-  return (
-    <>
-      <div className="section-heading" id={`guide-${block.keys[0]}`}>{block.heading}</div>
-      {body}
-      {help && <div className="field-hint field-hint--block">{help}</div>}
-    </>
-  );'''
+# Groups / unnamed inputs
+('<div className="copies-options">', '<div className="copies-options" role="radiogroup" aria-label="Number of copies">', 1),
+('<input type="text" inputMode="numeric" className="copies-others-input" value={othersValue}',
+ '<input type="text" inputMode="numeric" aria-label="Number of copies (other)" className="copies-others-input" value={othersValue}', 1),
+('<div className="purpose-grid">', '<div className="purpose-grid" role="group" aria-label="Purpose of request">', 1),
+('<input type="text" value={purposeOther} onChange={(e) => setPurposeOther(e.target.value)} />',
+ '<input type="text" aria-label="Specify other purpose" value={purposeOther} onChange={(e) => setPurposeOther(e.target.value)} />', 1),
+('<input type="text" value={data.registry_no}', '<input type="text" aria-label="Registry number (office use only)" value={data.registry_no}', 1),
+('<input type="date" value={data.date_of_registration}', '<input type="date" aria-label="Date of registration (office use only)" value={data.date_of_registration}', 1),
+('<input type="text" value={data.book}', '<input type="text" aria-label="Book (office use only)" value={data.book}', 1),
+('<input type="text" value={data.page}', '<input type="text" aria-label="Page (office use only)" value={data.page}', 1),
+('<input type="text" value={data.search_by}', '<input type="text" aria-label="Search by (office use only)" value={data.search_by}', 1),
+('<input className="sh-value" type="text" readOnly placeholder="Auto-generated" style={{ width: 110 }} />',
+ '<input className="sh-value" type="text" readOnly aria-label="Control number (assigned after submission)" placeholder="Auto-generated" style={{ width: 110 }} />', 1),
+('<input className="sh-value" type="text" defaultValue={today} readOnly style={{ width: 90 }} />',
+ '<input className="sh-value" type="text" defaultValue={today} readOnly aria-label="Date of request" style={{ width: 90 }} />', 1),
 
-STEPS_NEW = r'''const purposeText = buildPurposes(purposes, purposeOther);
+# Dialog title + badge
+('<div className="header-left"><div className="header-title">{recordWord}</div></div>',
+ '<div className="header-left"><h2 id="dialog-title" className="header-title">{recordWord}</h2></div>', 1),
+('<div className="header-badge">{recordWord}</div>', '<div className="header-badge" aria-hidden="true">{recordWord}</div>', 1),
+('<div className="form-status">{status === "error"', '<div className="form-status" role="status" aria-live="polite">{status === "error"', 1),
 
-  // Progress shown in the guide bar at the top of the form (live, nothing is blocked here).
-  const steps = [
-    { label: "Copies", done: copies !== "Others" || parseInt(copiesOther, 10) > 0,
-      target: "#guide-copies", hint: "Choose how many copies you need." },
-    { label: "Record details", done: cfg.blocks.every((b) => b.keys.every((k) => !validateSubjectField(b, k, subject[k]))),
-      target: `#guide-${cfg.blocks[0].keys[0]}`, hint: "Fill in the details of the record you are requesting." },
-    { label: "Your details", done: Object.keys(validateRequester(requester)).length === 0,
-      target: "#guide-requester", hint: "Fill in your own details under Requesting Party." },
-    { label: "Consent", done: consent,
-      target: ".consent-box", hint: "Tick the consent box near the bottom of the form." },
-  ];'''
+# Toasts
+('<div className="toast-wrap">', '<div className="toast-wrap" role="status" aria-live="polite">', 1),
+('<button className="toast-close" onClick={dismiss}>×</button>',
+ '<button className="toast-close" onClick={dismiss} aria-label="Dismiss notification">×</button>', 1),
 
-SET_VALUE_NEW = r'''const dirty = useRef(new Set()); // fields the client has typed in (so we don't scold untouched fields)
-  const setFieldError = (k, msg) => setErrors((p) => {
-    if (!msg && !p[k]) return p;
-    const n = { ...p };
-    if (msg) n[k] = msg; else delete n[k];
-    return n;
-  });
-  const setValue = (k, v) => {
-    dirty.current.add(k);
-    setSubject((p) => ({ ...p, [k]: v }));
-    // Once a message is showing, re-check while typing so it disappears as soon as it's fixed.
-    if (errors[k]) setFieldError(k, validateSubjectField(cfg.blocks.find((b) => b.keys.includes(k)), k, v));
-  };
-  const blurSubject = (block, k) => {
-    if (dirty.current.has(k) || (subject[k] || "").trim() || errors[k])
-      setFieldError(k, validateSubjectField(block, k, subject[k]));
-  };
-  const blurRequester = (k) => {
-    if (dirty.current.has(k) || (requester[k] || "").trim() || errors[k])
-      setFieldError(k, validateRequesterField(k, requester[k]));
-  };
-  useEffect(() => {
-    if (errors.num_copies && (copies !== "Others" || parseInt(copiesOther, 10) > 0)) setFieldError("num_copies", null);
-    if (errors.consent && consent) setFieldError("consent", null);
-  }, [copies, copiesOther, consent]); // eslint-disable-line react-hooks/exhaustive-deps
-  // "Edit" links on the review screen: go back to the form and scroll to that part.
-  const editSection = (target) => {
-    setStatus(null);
-    setReviewing(false);
-    setTimeout(() => goTo(target), 60);
-  };'''
+# Success screen: honest wording about device storage
+('function SuccessScreen({ result, type, email, onClose }) {', 'function SuccessScreen({ result, type, email, savedOnDevice, onClose }) {', 1),
+("your request. We've also saved it on this device for convenience, but a screenshot or note is safer.",
+ 'your request.{savedOnDevice ? " As you chose, it is also saved on this device." : " Keep a note or screenshot of it."}', 1),
+('<SuccessScreen result={result} type={kind} email={requester.requester_email.trim()} onClose={onClose} />',
+ '<SuccessScreen result={result} type={kind} email={requester.requester_email.trim()} savedOnDevice={remember} onClose={onClose} />', 1),
 
-UPDATE_R_NEW = r'''const updateR = (k, v) => {
-    dirty.current.add(k);
-    setRequester((p) => ({ ...p, [k]: v }));
-    if (errors[k]) setFieldError(k, validateRequesterField(k, v));
-  };'''
+# Consent state, validation, payload, opt-in storage
+('  const [reviewing, setReviewing] = useState(false);',
+ '  const [reviewing, setReviewing] = useState(false);\n  const [consent, setConsent] = useState(false);\n  const [remember, setRemember] = useState(false);', 1),
+('if (copies === "Others" && !(parseInt(copiesOther, 10) > 0)) errs.num_copies = "Enter a number of copies";',
+ 'if (copies === "Others" && !(parseInt(copiesOther, 10) > 0)) errs.num_copies = "Enter a number of copies";\n    if (!consent) errs.consent = "You must give your consent to submit this request.";', 1),
+('signature_printed_name: printedName,', 'signature_printed_name: printedName,\n        consent: "true",', 1),
+('if (res.control_no) {', 'if (res.control_no && remember) {', 1),
+('''            <IssuancePanel forms={FORM_TYPES[kind]} selected={issuance} onToggle={toggleIssuance} />
+          </div>''',
+'''            <IssuancePanel forms={FORM_TYPES[kind]} selected={issuance} onToggle={toggleIssuance} />
+          </div>
+          <ConsentCheckbox checked={consent} onChange={setConsent} error={errors.consent} />''', 1),
 
-INCOMPLETE_OLD = r'''    setErrors(errs);
-    if (Object.keys(errs).length > 0) {
-      pushToast({ title: "Incomplete form", message: "Please fill in all required fields.", success: false });
-      return;
-    }'''
+# Review screen: optional device-save checkbox
+('function ReviewScreen({ recordWord, theme, sections, sigFile, printedName, status, errorMessage, onBack, onConfirm }) {',
+ 'function ReviewScreen({ recordWord, theme, sections, sigFile, printedName, status, errorMessage, remember, onRememberChange, onBack, onConfirm }) {', 1),
+('''          { label: "Signature Over Printed Name", value: printedName },
+        ]} />''',
+'''          { label: "Signature Over Printed Name", value: printedName },
+        ]} />
+        <div className="section-heading">Optional</div>
+        <div className="review-consent">
+          <Checkbox label="Save my control number and email on this device so I can track this request later. I can remove it anytime from the tracking screen."
+            checked={remember} onChange={() => onRememberChange(!remember)} />
+        </div>''', 1),
+('<ReviewScreen recordWord={cfg.word} theme={theme} sections={sections} sigFile={sigFile}',
+ '<ReviewScreen recordWord={cfg.word} theme={theme} sections={sections} sigFile={sigFile} remember={remember} onRememberChange={setRemember}', 1),
 
-INCOMPLETE_NEW = r'''    setErrors(errs);
-    const count = Object.keys(errs).length;
-    if (count > 0) {
-      pushToast({
-        title: "Almost there",
-        message: `Please fix ${count} highlighted ${count === 1 ? "field" : "fields"} (marked in red), then press Review Request again.`,
-        success: false,
-      });
-      setTimeout(focusFirstError, 0);
-      return;
-    }'''
+# Tracking form
+('''          <div className="req-field">
+            Control Number
+            <input type="text" value={controlNo} onChange={(e) => setControlNo(e.target.value)}
+              placeholder="BR-20260929-00042" autoCapitalize="characters" />
+          </div>
+          <div className="req-field">
+            Email Address
+            <input type="email" value={email} onChange={(e) => setEmail(e.target.value)} placeholder="juandelacruz@gmail.com" />
+          </div>
+          {error && <div className="field-error" style={{ marginTop: 10 }}>{error}</div>}''',
+'''          <label className="req-field">
+            Control Number
+            <input type="text" value={controlNo} onChange={(e) => setControlNo(e.target.value)}
+              placeholder="BR-20260929-00042" autoCapitalize="characters" />
+          </label>
+          <label className="req-field">
+            Email Address
+            <input type="email" value={email} onChange={(e) => setEmail(e.target.value)} placeholder="juandelacruz@gmail.com" />
+          </label>
+          <p className="track-note">
+            We use these only to look up your request. See our{" "}
+            <a href="#/privacy" target="_blank" rel="noopener noreferrer">Privacy Policy (opens in a new tab)</a>.
+          </p>
+          {error && <div className="field-error" role="alert" style={{ marginTop: 10 }}>{error}</div>}''', 1),
+('onClick={forgetRecent}>Forget</button>', 'onClick={forgetRecent} aria-label="Forget the request saved on this device">Forget</button>', 1),
+('<div className="track-result">', '<div className="track-result" role="status">', 1),
 
-GUIDE_CSS = r'''/* ── Form guidance ── */
-.guide-bar{padding:12px 28px 10px;background:#fff;border-bottom:1px solid #e2ecf8;}
-.guide-lead{font-size:0.78rem;line-height:1.5;margin-bottom:8px;}
-.guide-steps{list-style:none;display:flex;flex-wrap:wrap;gap:6px 8px;margin:0 0 8px;}
-.guide-step{
-  display:inline-flex;align-items:center;gap:6px;min-height:30px;
-  font-family:inherit;font-size:0.72rem;padding:3px 12px 3px 4px;
-  border:1px solid #c8d9f0;border-radius:100px;background:#fff;cursor:pointer;
-}
-.guide-step:hover{background:#f4f8fd;}
-.guide-dot{
-  width:20px;height:20px;border-radius:50%;border:1.5px solid #9fb8d6;
-  display:inline-flex;align-items:center;justify-content:center;font-size:0.62rem;font-weight:600;
-}
-.guide-step.next{border-color:var(--modal-primary);background:var(--modal-tint-bg);}
-.guide-step.next .guide-dot{border-color:var(--modal-primary);}
-.guide-step.done .guide-dot{background:var(--modal-primary);border-color:var(--modal-primary);}
-.form-paper .guide-step.done .guide-dot{color:#fff;}
-.guide-next{font-size:0.74rem;line-height:1.45;}
-.form-paper .field-hint{font-size:0.7rem;line-height:1.45;color:#3f5b7d;margin-top:3px;}
-.form-paper .field-hint--block{margin:-4px 0 10px;}
-.form-paper .purpose-section .field-hint{margin:-4px 0 10px;}
-.form-paper .copies-row .field-hint{margin:-3px 0 8px;}
-.review-edit{
-  order:1;font:inherit;font-size:0.72rem;text-transform:none;letter-spacing:0;
-  background:none;border:none;cursor:pointer;text-decoration:underline;padding:2px 4px;
-}
-.form-paper .review-edit{color:var(--modal-primary);}
-[id^="guide-"]{scroll-margin-top:12px;}
-.sr-only{position:absolute;width:1px;height:1px;margin:-1px;padding:0;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0;}
-@media(max-width:640px){.guide-bar{padding:12px 18px 10px;}}'''
+# Modal: dialog semantics, focus trap, focus restore
+('  const closeRef = useRef(onClose);', '  const closeRef = useRef(onClose);\n  const overlayRef = useRef(null);', 1),
+('const fn = (e) => { if (e.key === "Escape") closeRef.current(); };',
+ '''const opener = document.activeElement;
+    const sel = 'a[href],button:not([disabled]),input:not([disabled]),select,textarea,[tabindex]:not([tabindex="-1"])';
+    const focusables = () => Array.from(overlayRef.current?.querySelectorAll(sel) || [])
+      .filter((el) => el.getClientRects().length > 0);
+    overlayRef.current?.focus();
+    const fn = (e) => {
+      if (e.key === "Escape") { closeRef.current(); return; }
+      if (e.key !== "Tab") return;
+      const items = focusables();
+      if (!items.length) { e.preventDefault(); return; }
+      const first = items[0], last = items[items.length - 1];
+      const inside = overlayRef.current.contains(document.activeElement) && document.activeElement !== overlayRef.current;
+      if (e.shiftKey && (!inside || document.activeElement === first)) { e.preventDefault(); last.focus(); }
+      else if (!e.shiftKey && (!inside || document.activeElement === last)) { e.preventDefault(); first.focus(); }
+    };''', 1),
+('return () => { document.removeEventListener("keydown", fn); document.body.style.overflow = ""; };',
+ 'return () => { document.removeEventListener("keydown", fn); document.body.style.overflow = ""; opener?.focus?.(); };', 1),
+('<div className="overlay" onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}>',
+ '<div ref={overlayRef} className="overlay" role="dialog" aria-modal="true" aria-labelledby="dialog-title" tabIndex={-1}\n      onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}>', 1),
 
-# ───────────────────────── edit list ─────────────────────────
-# (old, new, expected_count)
-FE = [
-# Guidance helpers + components (inserted just before the purposes helper)
-('// Only checked purposes are sent, and the "Others" text is attached only',
- GUIDANCE_BLOCK + '// Only checked purposes are sent, and the "Others" text is attached only', 1),
+# Authorization clause: fix "DAPA" typo, link policy
+('/ The DAPA of 2012 (R.A. 10173)',
+ 'The Data Privacy Act of 2012 (R.A. 10173) applies to the personal information in this request. See our <a href="#/privacy" target="_blank" rel="noopener noreferrer">Privacy Policy (opens in a new tab)</a>.', 1),
 
-# Friendlier requester validation (one shared rule set, used live and on submit)
-(VALIDATE_REQUESTER_OLD, VALIDATE_REQUESTER_NEW, 1),
-('return "Enter a valid mobile number (09XXXXXXXXX or +63 9XXXXXXXXX)";',
- 'return "Mobile number should be 11 digits starting with 09 (like 09171234567), or +63 followed by 10 digits.";', 1),
+# App root: routing, landmarks, headings, footer
+('  const [active, setActive] = useState(null);\n  return (',
+ '  const [active, setActive] = useState(null);\n  const route = useHashRoute();\n  const legalPage = LEGAL_ROUTES.includes(route) ? route : null;\n  return (', 1),
+('<style>{extraStyles}</style>', '<style>{extraStyles}</style>\n      <style>{LEGAL_CSS}</style>', 1),
+('      <div className="landing">',
+ '      {legalPage ? <LegalPage page={legalPage} /> : (<>\n      <main className="landing">', 1),
+('''          <div className="office-name">
+            Local Civil Registrar
+            <span className="office-loc">San Carlos City, Negros Occidental</span>
+          </div>''',
+'''          <h1 className="office-name">
+            Local Civil Registrar
+            <span className="office-loc">San Carlos City, Negros Occidental</span>
+          </h1>''', 1),
+('<div className="select-prompt">Select record type to request</div>', '<h2 className="select-prompt">Select record type to request</h2>', 1),
+('''        {active && <Modal type={active} onClose={() => setActive(null)} />}
+      </div>''',
+'''        {active && <Modal type={active} onClose={() => setActive(null)} />}
+      </main>
+      <SiteFooter />
+      </>)}''', 1),
 
-# Copies: anchor, hint, error state on the "Others" box
-('<div className="copies-row">', '<div className="copies-row" id="guide-copies">', 1),
-('<div className="copies-row-label">Number of Copies — Please check appropriate box</div>',
- '<div className="copies-row-label">Number of Copies — Please check appropriate box</div>\n      <div className="field-hint">Need more than three? Choose Others and type the number.</div>', 1),
-('aria-label="Number of copies (other)"', 'aria-label="Number of copies (other)" aria-invalid={!!error}', 1),
-
-# Purpose hint
-('<div className="purpose-header">Purpose — Check Appropriate Box</div>',
- '<div className="purpose-header">Purpose — Check Appropriate Box</div>\n      <div className="field-hint">Tick all that apply. This helps the office prepare the right document.</div>', 1),
-
-# Signature note
-('<div className="sig-note">PNG, JPG, WEBP or PDF · max 2 MB</div>',
- '<div className="sig-note">Optional. Upload a clear photo or scan of your signature. PNG, JPG, WEBP or PDF, up to 2 MB.</div>', 1),
-
-# Requester fields: hints, blur validation, placeholders
-('function RequesterFields({ data, onChange, errors, sigFile, onSigChange, printedName, onPrintedNameChange }) {',
- 'function RequesterFields({ data, onChange, errors, onBlurField, sigFile, onSigChange, printedName, onPrintedNameChange }) {', 1),
-(TEXT_FN_OLD, TEXT_FN_NEW, 1),
-('{text("requester_address", "Address *")}',
- '{text("requester_address", "Address *", { placeholder: "House no., Street, Barangay, City" })}', 1),
-('{text("requester_telephone", "Telephone No.", {',
- '{text("requester_telephone", "Telephone No. (optional)", {', 1),
-('type: "tel", inputMode: "tel",', 'type: "tel", inputMode: "tel", placeholder: "09171234567",', 1),
-
-# Subject fields: required star on the small label, blur validation
-('function SubjectField({ k, cls, placeholder, sub, heading, values, setValue, errors }) {',
- 'function SubjectField({ k, cls, placeholder, sub, heading, required = [], onBlur, values, setValue, errors }) {', 1),
-('onChange={(e) => setValue(k, e.target.value)} placeholder={placeholder}',
- 'onChange={(e) => setValue(k, e.target.value)} onBlur={() => onBlur && onBlur(k)} placeholder={placeholder}', 1),
-('aria-invalid={!!errors[k]} />', 'aria-invalid={!!errors[k]} aria-required={required.includes(k)} />', 1),
-('<span className="sub-label">{sub}</span>', '<span className="sub-label">{sub}{required.includes(k) ? " *" : ""}</span>', 1),
-('function SubjectBlock({ block, values, setValue, errors }) {',
- 'function SubjectBlock({ block, values, setValue, errors, onBlurField }) {', 1),
-('const common = { values, setValue, errors, heading: block.heading };',
- 'const common = { values, setValue, errors, heading: block.heading, required: block.required,\n    onBlur: onBlurField && ((k) => onBlurField(block, k)) };', 1),
-('return (<><div className="section-heading">{block.heading}</div>{body}</>);', SUBJECT_RETURN_NEW, 1),
-
-# Review screen: Edit links + clearer intro
-('function ReviewSection({ title, rows }) {', 'function ReviewSection({ title, rows, onEdit }) {', 1),
-('<div className="section-heading">{title}</div>',
- '<div className="section-heading">{title}{onEdit && <button type="button" className="review-edit" onClick={onEdit} aria-label={`Edit ${title}`}>Edit</button>}</div>', 1),
-('function ReviewScreen({ recordWord, theme, sections, sigFile, printedName, status, errorMessage, remember, onRememberChange, onBack, onConfirm }) {',
- 'function ReviewScreen({ recordWord, theme, sections, sigFile, printedName, status, errorMessage, remember, onRememberChange, onEdit, onBack, onConfirm }) {', 1),
-('Please review the details below carefully. Once you confirm, this request will be',
- 'Almost done! Please check your details below. If something is wrong, choose Edit next to that section. When everything looks right, press Confirm & Submit. Your request will then be', 1),
-('{sections.map((sec) => <ReviewSection key={sec.title} title={sec.title} rows={sec.rows} />)}',
- '{sections.map((sec) => <ReviewSection key={sec.title} title={sec.title} rows={sec.rows}\n          onEdit={sec.target ? () => onEdit(sec.target) : undefined} />)}', 1),
-('<ReviewSection title="Signature" rows={[',
- '<ReviewSection title="Signature" onEdit={() => onEdit("#guide-requester")} rows={[', 1),
-
-# RequestForm: live progress, handlers
-('const purposeText = buildPurposes(purposes, purposeOther);', STEPS_NEW, 1),
-('const setValue = (k, v) => setSubject((p) => ({ ...p, [k]: v }));', SET_VALUE_NEW, 1),
-('const updateR = (k, v) => setRequester((p) => ({ ...p, [k]: v }));', UPDATE_R_NEW, 1),
-
-# Submit-blocking validation (same rules as the live checks)
-('''    const errs = validateRequester(requester);
-    cfg.blocks.forEach((b) => b.required.forEach((k) => { if (!subject[k].trim()) errs[k] = "Required"; }));''',
- '''    const errs = validateRequester(requester);
-    cfg.blocks.forEach((b) => b.keys.forEach((k) => { const m = validateSubjectField(b, k, subject[k]); if (m) errs[k] = m; }));''', 1),
-('errs.num_copies = "Enter a number of copies";',
- 'errs.num_copies = "Please type how many copies you need (a number, like 4).";', 1),
-('errs.consent = "You must give your consent to submit this request.";',
- 'errs.consent = "Please tick the consent box to continue.";', 1),
-(INCOMPLETE_OLD, INCOMPLETE_NEW, 1),
-
-# Review sections: where "Edit" should take the client
-('{ title: "Request Details", rows: [', '{ title: "Request Details", target: "#guide-copies", rows: [', 1),
-('{ title: "Record Details", rows: [', '{ title: "Record Details", target: `#guide-${cfg.blocks[0].keys[0]}`, rows: [', 1),
-('{ title: "Requesting Party", rows: [', '{ title: "Requesting Party", target: "#guide-requester", rows: [', 1),
-('onBack={() => { setStatus(null); setReviewing(false); }} onConfirm={handleConfirmSubmit} />',
- 'onEdit={editSection} onBack={() => { setStatus(null); setReviewing(false); }} onConfirm={handleConfirmSubmit} />', 1),
-
-# Form layout: guide bar, blur handlers, anchors, button label
-('<FormSubheader />', '<FormSubheader />\n      <FormGuide steps={steps} />', 1),
-('<SubjectBlock key={b.heading} block={b} values={subject} setValue={setValue} errors={errors} />',
- '<SubjectBlock key={b.heading} block={b} values={subject} setValue={setValue} errors={errors} onBlurField={blurSubject} />', 1),
-('<div className="req-section">', '<div className="req-section" id="guide-requester">', 1),
-('<RequesterFields data={requester} onChange={updateR} errors={errors}',
- '<RequesterFields data={requester} onChange={updateR} errors={errors} onBlurField={blurRequester}', 1),
-('onCancel={onClose} onSubmit={handleSubmit} />',
- 'onCancel={onClose} onSubmit={handleSubmit} submitLabel="Review Request" />', 1),
-
-# CSS (appended to the existing extraStyles block)
-('  .form-paper input[type="tel"]{font-size:16px;}\n}',
- '  .form-paper input[type="tel"]{font-size:16px;}\n}\n\n' + GUIDE_CSS, 1),
+# LAST: replace-all so every remaining error message is announced
+('<div className="field-error">', '<div className="field-error" role="alert">', None),
 ]
 
+BE = [
+('    missing = [f for f in cfg["required"] + ALWAYS_REQUIRED if not row.get(f)]',
+ '''    # Explicit consent must be sent by the form (enforced server-side, not just in the UI).
+    if str(data.get("consent", "")).strip().lower() not in ("true", "1", "yes"):
+        return jsonify({"error": "Consent to the Privacy Policy is required to submit a request."}), 400
+
+    missing = [f for f in cfg["required"] + ALWAYS_REQUIRED if not row.get(f)]''', 1),
+]
 
 def apply(path, edits):
     raw = open(path, encoding="utf-8", newline="").read()
@@ -381,22 +214,24 @@ def apply(path, edits):
     problems = []
     for old, new, cnt in edits:
         n = text.count(old)
-        if n != cnt:
-            problems.append(f"expected {cnt} match(es), found {n}: {old[:80]!r}")
+        if (cnt is None and n < 1) or (cnt is not None and n != cnt):
+            problems.append(f"expected {cnt or '>=1'} match(es), found {n}: {old[:70]!r}")
             continue
         text = text.replace(old, new)
     return path, text, crlf, problems
 
-
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("--frontend", required=True, help="path to client/src/component/request.jsx")
+    ap.add_argument("--frontend"); ap.add_argument("--backend")
     a = ap.parse_args()
-    path, text, crlf, problems = apply(a.frontend, FE)
-    if problems:
-        for m in problems:
-            print(f"[{path}] {m}")
+    jobs = []
+    if a.frontend: jobs.append(apply(a.frontend, FE))
+    if a.backend: jobs.append(apply(a.backend, BE))
+    bad = [(p, m) for p, _, _, pr in jobs for m in pr]
+    if bad:
+        for p, m in bad: print(f"[{p}] {m}")
         sys.exit("No files were changed (fix the mismatches above, or send me your current file).")
-    shutil.copy(path, path + ".bak")
-    open(path, "w", encoding="utf-8", newline="").write(text.replace("\n", "\r\n") if crlf else text)
-    print("patched", path, f"({len(FE)} edits, backup: {path}.bak)")
+    for p, text, crlf, _ in jobs:
+        shutil.copy(p, p + ".bak")
+        open(p, "w", encoding="utf-8", newline="").write(text.replace("\n", "\r\n") if crlf else text)
+        print("patched", p)
