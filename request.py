@@ -3,17 +3,15 @@ import datetime
 import hmac
 import os
 import re
-import threading
-import time
 import uuid
-from collections import defaultdict, deque
 from functools import wraps
 
 from dotenv import load_dotenv
-load_dotenv()  # must run BEFORE supabase_client is imported
-
+load_dotenv()  # must run BEFORE supabase_client / email_verification are imported
+from email_verification import consume_verification, is_email_verified, verification_bp
 from flask import Flask, request, jsonify, Response
 from flask_cors import CORS
+from http_utils import client_ip, rate_limited
 from supabase_client import supabase
 
 app = Flask(__name__)
@@ -29,6 +27,7 @@ ADMIN_API_KEY = os.environ.get("ADMIN_API_KEY")
 DEBUG = os.environ.get("FLASK_DEBUG") == "1"
 
 CORS(app, resources={r"/api/*": {"origins": ALLOWED_ORIGINS}})
+app.register_blueprint(verification_bp)  # /api/verify/send, /api/verify/confirm
 
 BUCKET = "signatures"
 MAX_SIG_BYTES = 2 * 1024 * 1024
@@ -64,7 +63,7 @@ COMMON = ["num_copies", "purposes", "form_type",
           "requester_email",
           "registry_no", "date_of_registration", "book", "page", "search_by",
           "signature_printed_name"]
-# requester_email is now enforced server-side too (the form already requires it).
+# requester_email is enforced server-side too (the form already requires it).
 ALWAYS_REQUIRED = ["requester_name", "requester_relationship", "requester_address", "requester_email"]
 
 STATUS_ORDER = ["PENDING", "PROCESSING", "COMPLETED"]
@@ -76,7 +75,8 @@ STATUS_LABELS = {
 }
 
 # NOTE (migration): assumes civil_registry_request has an
-# `updated_at timestamptz` column (nullable is fine).
+# `updated_at timestamptz` column (nullable is fine), and that the
+# `email_verification` table from email_verification.sql exists.
 
 # ── Validation patterns (mirror the frontend) ────────────────
 EMAIL_RE = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
@@ -94,31 +94,6 @@ def clean(v):
 
 def gen_control(prefix, record_id):
     return f"{prefix}-{datetime.date.today():%Y%m%d}-{record_id:05d}"
-
-
-def client_ip():
-    # NOTE: X-Forwarded-For is only trustworthy behind your own proxy/host
-    # (Render, Railway, nginx...). Otherwise a client can spoof it.
-    fwd = request.headers.get("X-Forwarded-For", "")
-    return (fwd.split(",")[0].strip() or request.remote_addr or "unknown")
-
-
-# Simple in-memory sliding-window limiter. Fine for a single process; if you
-# run several gunicorn workers, switch to Flask-Limiter with a Redis backend.
-_hits = defaultdict(deque)
-_hits_lock = threading.Lock()
-
-
-def rate_limited(key, limit, window_seconds):
-    now = time.monotonic()
-    with _hits_lock:
-        q = _hits[key]
-        while q and now - q[0] > window_seconds:
-            q.popleft()
-        if len(q) >= limit:
-            return True
-        q.append(now)
-        return False
 
 
 def admin_required(fn):
@@ -290,7 +265,17 @@ def submit(kind):
     if field_errors:
         return jsonify({"error": " ".join(field_errors.values()), "fields": field_errors}), 400
 
-    # Invalid signatures are now rejected loudly instead of silently dropped.
+    # Store emails lowercase so tracking and verification always compare the same value.
+    row["requester_email"] = row["requester_email"].lower()
+
+    # The requester's email must have been verified with a one-time code.
+    if not is_email_verified(row["requester_email"], data.get("verification_token")):
+        return jsonify({
+            "error": "Please verify your email address before submitting your request.",
+            "code": "EMAIL_NOT_VERIFIED",
+        }), 403
+
+    # Invalid signatures are rejected loudly instead of silently dropped.
     try:
         if uploaded_file is not None:
             raw, mime = extract_signature_from_upload(uploaded_file)
@@ -323,6 +308,9 @@ def submit(kind):
                 print(f"[request] rollback (file delete) failed: {e2}")
         return jsonify({"error": "We couldn't save your request. Please try again."}), 500
 
+    # One verification = one submission.
+    consume_verification(row["requester_email"])
+
     create_request_notification(supabase, {**row, **rec, "control_no": control_no})
 
     return jsonify({"record_id": record_id, "control_no": control_no,
@@ -333,12 +321,12 @@ def submit(kind):
 @app.get("/api/health")
 def health():
     missing = []
-    for t in REQUIRED_TABLES:
+    for t in REQUIRED_TABLES + ["email_verification"]:
         try:
-            supabase.table(t).select("id").limit(1).execute()
+            supabase.table(t).select("*").limit(1).execute()
         except Exception:
             missing.append(t)
-    if len(missing) == len(REQUIRED_TABLES):
+    if len(missing) >= len(REQUIRED_TABLES) + 1:
         return jsonify({"db": "error", "error": "Cannot read any table. Check SUPABASE_URL / SUPABASE_KEY."}), 500
     return jsonify({"db": "connected", "missing": missing})
 
@@ -359,10 +347,9 @@ def marriage_submit():
 
 
 # ── PUBLIC TRACKING ──────────────────────────────────────────
-# Changed from GET /api/track/<control_no> to POST /api/track so the email
-# never appears in URLs/logs. The citizen must supply BOTH the control number
-# and the email used on the request, so guessing control numbers gets an
-# attacker nothing. Subject names are masked in the response.
+# POST /api/track so the email never appears in URLs/logs. The citizen must
+# supply BOTH the control number and the email used on the request, so guessing
+# control numbers gets an attacker nothing. Subject names are masked.
 @app.post("/api/track")
 def track_request():
     if rate_limited(f"track:{client_ip()}", limit=10, window_seconds=900):
