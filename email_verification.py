@@ -1,4 +1,6 @@
-"""Email verification by one-time code (OTP), sent through Gmail SMTP.
+"""Email verification by one-time code (OTP), sent through the Brevo HTTPS API.
+
+(SMTP is blocked on Render's free tier, so we send over HTTPS instead.)
 
 Flow
   1. POST /api/verify/send    {email}        -> emails a 6-digit code (10 min)
@@ -9,22 +11,21 @@ Flow
 Only HMAC hashes of the code and token are stored, never the raw values.
 
 Environment variables
-  GMAIL_USER           Gmail address that sends the codes
-  GMAIL_APP_PASSWORD   16-character Google App Password (needs 2-Step Verification)
+  BREVO_API_KEY        Brevo API key (starts with xkeysib-)
+  MAIL_FROM_EMAIL      Sender address verified in Brevo (e.g. forcapstone9@gmail.com)
   VERIFICATION_SECRET  long random string used to hash codes/tokens
   MAIL_FROM_NAME       optional display name for the sender
 """
 import hashlib
 import hmac
+import json
 import math
 import os
 import re
 import secrets
-import smtplib
-import ssl
+import urllib.error
+import urllib.request
 from datetime import datetime, timedelta, timezone
-from email.message import EmailMessage
-from email.utils import formataddr
 
 from flask import Blueprint, jsonify, request
 
@@ -50,16 +51,15 @@ def _secret():
     return os.environ.get("VERIFICATION_SECRET", "")
 
 
-def _mail_credentials():
-    user = os.environ.get("GMAIL_USER", "").strip()
-    # Google displays app passwords in groups separated by spaces.
-    password = os.environ.get("GMAIL_APP_PASSWORD", "").replace(" ", "")
-    return user, password
+def _mail_config():
+    api_key = os.environ.get("BREVO_API_KEY", "").strip()
+    sender = os.environ.get("MAIL_FROM_EMAIL", "").strip()
+    return api_key, sender
 
 
 def _is_configured():
-    user, password = _mail_credentials()
-    return bool(_secret() and user and password)
+    api_key, sender = _mail_config()
+    return bool(_secret() and api_key and sender)
 
 
 # ── Helpers ──────────────────────────────────────────────────
@@ -96,34 +96,50 @@ def _update_record(email, fields):
 
 
 def _send_code_email(to_email, code):
-    user, password = _mail_credentials()
+    api_key, sender = _mail_config()
     minutes = CODE_TTL_SECONDS // 60
 
-    msg = EmailMessage()
-    msg["Subject"] = "Your verification code - Local Civil Registrar"
-    msg["From"] = formataddr((os.environ.get("MAIL_FROM_NAME", "Local Civil Registrar - San Carlos City"), user))
-    msg["To"] = to_email
-    msg.set_content(
+    text = (
         f"Your verification code is: {code}\n\n"
         f"It expires in {minutes} minutes. Enter it on the request form to confirm your email address.\n\n"
         "If you did not request this code, you can safely ignore this email."
     )
-    msg.add_alternative(
-        f"""\
+    html = f"""\
 <div style="font-family:Arial,sans-serif;max-width:420px;margin:0 auto;padding:24px;color:#0f1f3d;">
   <h2 style="margin:0 0 12px;font-size:18px;">Local Civil Registrar</h2>
   <p style="margin:0 0 16px;font-size:14px;">Use this code to confirm your email address:</p>
   <p style="margin:0 0 16px;font-size:32px;font-weight:700;letter-spacing:8px;">{code}</p>
   <p style="margin:0 0 8px;font-size:13px;color:#5577a0;">It expires in {minutes} minutes.</p>
   <p style="margin:0;font-size:13px;color:#5577a0;">If you did not request this code, you can safely ignore this email.</p>
-</div>""",
-        subtype="html",
-    )
+</div>"""
 
-    context = ssl.create_default_context()
-    with smtplib.SMTP_SSL("smtp.gmail.com", 465, context=context, timeout=15) as server:
-        server.login(user, password)
-        server.send_message(msg)
+    payload = {
+        "sender": {
+            "name": os.environ.get("MAIL_FROM_NAME", "Local Civil Registrar - San Carlos City"),
+            "email": sender,
+        },
+        "to": [{"email": to_email}],
+        "subject": "Your verification code - Local Civil Registrar",
+        "htmlContent": html,
+        "textContent": text,
+    }
+    req = urllib.request.Request(
+        "https://api.brevo.com/v3/smtp/email",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "api-key": api_key,
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "User-Agent": "lcr-backend/1.0",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            resp.read()
+    except urllib.error.HTTPError as e:
+        # Include Brevo's explanation so the Render logs show why it failed.
+        raise RuntimeError(f"Brevo HTTP {e.code}: {e.read().decode('utf-8', 'replace')}") from e
 
 
 # ── Public API used by request.py ────────────────────────────
@@ -165,7 +181,7 @@ def send_code():
         return jsonify({"error": "Enter a valid email address."}), 400
 
     if not _is_configured():
-        print("[verify] GMAIL_USER / GMAIL_APP_PASSWORD / VERIFICATION_SECRET is not set")
+        print("[verify] BREVO_API_KEY / MAIL_FROM_EMAIL / VERIFICATION_SECRET is not set")
         return jsonify({"error": "Email verification is temporarily unavailable."}), 503
 
     if rate_limited(f"verify-send-ip:{client_ip()}", limit=10, window_seconds=3600) or \
