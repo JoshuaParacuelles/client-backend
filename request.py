@@ -23,10 +23,16 @@ app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1)  # one proxy hop (Rend
 limiter.init_app(app)
 
 # ── Config (all environment-driven) ──────────────────────────
-# ALLOWED_ORIGINS: comma-separated list, e.g.
+# ALLOWED_ORIGINS: comma-separated list of exact origins, e.g.
 #   https://lcr-request.vercel.app,https://lcr-admin.vercel.app
 # Defaults to "*" so local development keeps working, but SET IT in production.
 ALLOWED_ORIGINS = [o.strip() for o in os.environ.get("ALLOWED_ORIGINS", "*").split(",") if o.strip()]
+
+# ALLOWED_ORIGIN_REGEX (optional): lets Vercel preview deployments of THIS project
+# call the API. Every deployment gets a new URL, so exact matching keeps breaking.
+# Example (Render env var):
+#   ^https://client-[a-z0-9]+-joshua-paracuelles-projects\.vercel\.app$
+ORIGIN_REGEX = os.environ.get("ALLOWED_ORIGIN_REGEX", "").strip()
 
 # fail closed in production
 IS_PROD = os.environ.get("APP_ENV") == "production"
@@ -38,7 +44,12 @@ if IS_PROD and ("*" in ALLOWED_ORIGINS or not ALLOWED_ORIGINS):
 ADMIN_API_KEY = os.environ.get("ADMIN_API_KEY")
 DEBUG = os.environ.get("FLASK_DEBUG") == "1"
 
-CORS(app, resources={r"/api/*": {"origins": ALLOWED_ORIGINS}})
+# Flask-CORS accepts both exact strings and compiled regex patterns.
+CORS_ORIGINS = list(ALLOWED_ORIGINS)
+if ORIGIN_REGEX:
+    CORS_ORIGINS.append(re.compile(ORIGIN_REGEX))
+
+CORS(app, resources={r"/api/*": {"origins": CORS_ORIGINS}})
 app.register_blueprint(verification_bp)  # /api/verify/send, /api/verify/confirm
 
 BUCKET = "signatures"
