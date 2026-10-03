@@ -1,26 +1,38 @@
 import base64
+import calendar
 import datetime
 import hmac
 import os
 import re
 import uuid
 from functools import wraps
+from zoneinfo import ZoneInfo
 
+from werkzeug.middleware.proxy_fix import ProxyFix
 from dotenv import load_dotenv
 load_dotenv()  # must run BEFORE supabase_client / email_verification are imported
+
+from extensions import limiter
 from email_verification import consume_verification, is_email_verified, verification_bp
 from flask import Flask, request, jsonify, Response
 from flask_cors import CORS
-from http_utils import client_ip, rate_limited
 from supabase_client import supabase
 
 app = Flask(__name__)
+app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1)  # one proxy hop (Render)
+limiter.init_app(app)
 
 # ── Config (all environment-driven) ──────────────────────────
 # ALLOWED_ORIGINS: comma-separated list, e.g.
 #   https://lcr-request.vercel.app,https://lcr-admin.vercel.app
 # Defaults to "*" so local development keeps working, but SET IT in production.
 ALLOWED_ORIGINS = [o.strip() for o in os.environ.get("ALLOWED_ORIGINS", "*").split(",") if o.strip()]
+
+# fail closed in production
+IS_PROD = os.environ.get("APP_ENV") == "production"
+if IS_PROD and ("*" in ALLOWED_ORIGINS or not ALLOWED_ORIGINS):
+    raise RuntimeError("Set ALLOWED_ORIGINS to your real frontend origin(s) in production.")
+
 # ADMIN_API_KEY: required for signature + notification endpoints. If unset,
 # those endpoints are disabled (fail closed) instead of being public.
 ADMIN_API_KEY = os.environ.get("ADMIN_API_KEY")
@@ -80,8 +92,9 @@ STATUS_LABELS = {
 
 # ── Validation patterns (mirror the frontend) ────────────────
 EMAIL_RE = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
-PH_LOCAL_RE = re.compile(r"^0\d{10}$")
-PH_INTL_RE = re.compile(r"^\+63\d{10}$")
+# stricter PH mobile numbers
+PH_LOCAL_RE = re.compile(r"^09\d{9}$")
+PH_INTL_RE = re.compile(r"^\+639\d{9}$")
 
 
 # ── Helpers ──────────────────────────────────────────────────
@@ -92,8 +105,10 @@ def clean(v):
     return v
 
 
+# control-number fallback now uses Manila time (the DB trigger is the primary path)
 def gen_control(prefix, record_id):
-    return f"{prefix}-{datetime.date.today():%Y%m%d}-{record_id:05d}"
+    today = datetime.datetime.now(ZoneInfo("Asia/Manila"))
+    return f"{prefix}-{today:%Y%m%d}-{record_id:05d}"
 
 
 def admin_required(fn):
@@ -101,8 +116,9 @@ def admin_required(fn):
     def wrapper(*args, **kwargs):
         if not ADMIN_API_KEY:
             return jsonify({"error": "Admin endpoints are disabled."}), 503
-        supplied = request.headers.get("X-Admin-Key", "")
-        if not hmac.compare_digest(supplied, ADMIN_API_KEY):
+        # bytes compare (str compare_digest raises on non-ASCII input)
+        supplied = request.headers.get("X-Admin-Key", "").encode("utf-8")
+        if not hmac.compare_digest(supplied, ADMIN_API_KEY.encode("utf-8")):
             return jsonify({"error": "Unauthorized"}), 401
         return fn(*args, **kwargs)
     return wrapper
@@ -111,6 +127,11 @@ def admin_required(fn):
 @app.errorhandler(413)
 def too_large(_e):
     return jsonify({"error": "Upload is too large. The signature file must be 2 MB or smaller."}), 413
+
+
+@app.errorhandler(429)
+def rate_limit_hit(_e):
+    return jsonify({"error": "Too many requests. Please slow down and try again shortly."}), 429
 
 
 # ── Signature handling ───────────────────────────────────────
@@ -241,11 +262,64 @@ def validate_row(row):
     return errs
 
 
+# ── Date + length validation (mirrors the frontend) ──────────
+MONTH_NAMES = [m.lower() for m in calendar.month_name if m]
+
+
+def parse_month(v):
+    s = (v or "").strip().lower().rstrip(".")
+    if s.isdigit():
+        return int(s) if 1 <= int(s) <= 12 else 0
+    if len(s) >= 3:
+        for i, name in enumerate(MONTH_NAMES, 1):
+            if name.startswith(s):
+                return i
+    return 0  # invalid
+
+
+def validate_dates(kind, row):
+    if kind == "marriage":
+        return {}
+    p = kind  # "birth" | "death"
+    yk, mk, dk = f"{p}_year", f"{p}_month", f"{p}_date"
+    today = datetime.datetime.now(ZoneInfo("Asia/Manila")).date()
+    errs, year, month, day = {}, 0, 0, 0
+    y, m, d = row.get(yk), row.get(mk), row.get(dk)
+    if y:
+        if re.fullmatch(r"\d{4}", y) and 1850 <= int(y) <= today.year:
+            year = int(y)
+        else:
+            errs[yk] = f"Enter a valid 4-digit year (1850-{today.year})."
+    if m:
+        month = parse_month(m)
+        if not month:
+            errs[mk] = "Enter a valid month."
+    if d:
+        if re.fullmatch(r"\d{1,2}", d) and 1 <= int(d) <= 31:
+            day = int(d)
+        else:
+            errs[dk] = "Enter a valid day (1-31)."
+    if year and month and day:
+        try:
+            if datetime.date(year, month, day) > today:
+                errs[dk] = "Date cannot be in the future."
+        except ValueError:
+            errs[dk] = "That date does not exist."
+    elif year and month and datetime.date(year, month, 1) > today:
+        errs[mk] = "Date cannot be in the future."
+    return errs
+
+
+MAX_FIELD_LEN = 255
+
+
+def validate_lengths(row):
+    return {k: "Too long." for k, v in row.items()
+            if isinstance(v, str) and len(v) > MAX_FIELD_LEN}
+
+
 # ── Submit ───────────────────────────────────────────────────
 def submit(kind):
-    if rate_limited(f"submit:{client_ip()}", limit=10, window_seconds=3600):
-        return jsonify({"error": "Too many requests. Please try again later."}), 429
-
     cfg = KINDS[kind]
     data, uploaded_file = get_incoming_fields(kind)
 
@@ -261,7 +335,7 @@ def submit(kind):
     if missing:
         return jsonify({"error": f"Missing required field(s): {', '.join(missing)}"}), 400
 
-    field_errors = validate_row(row)
+    field_errors = {**validate_lengths(row), **validate_row(row), **validate_dates(kind, row)}
     if field_errors:
         return jsonify({"error": " ".join(field_errors.values()), "fields": field_errors}), 400
 
@@ -289,10 +363,13 @@ def submit(kind):
     try:
         sig_path = store_signature(kind, raw, mime)
         row["signature_path"] = sig_path
+        # single insert (DB trigger assigns control_no)
         rec = supabase.table(cfg["table"]).insert(row).execute().data[0]
         record_id = rec["id"]
-        control_no = gen_control(cfg["prefix"], record_id)
-        supabase.table(cfg["table"]).update({"control_no": control_no}).eq("id", record_id).execute()
+        control_no = rec.get("control_no")
+        if not control_no:  # trigger not installed yet: old behaviour
+            control_no = gen_control(cfg["prefix"], record_id)
+            supabase.table(cfg["table"]).update({"control_no": control_no}).eq("id", record_id).execute()
     except Exception as e:
         print(f"[request] submit failed, rolling back: {e}")
         # Roll back so a retry can't create duplicates / orphaned files.
@@ -319,6 +396,7 @@ def submit(kind):
 
 # ── Health ───────────────────────────────────────────────────
 @app.get("/api/health")
+@limiter.exempt
 def health():
     missing = []
     for t in REQUIRED_TABLES + ["email_verification"]:
@@ -327,21 +405,31 @@ def health():
         except Exception:
             missing.append(t)
     if len(missing) >= len(REQUIRED_TABLES) + 1:
-        return jsonify({"db": "error", "error": "Cannot read any table. Check SUPABASE_URL / SUPABASE_KEY."}), 500
+        return jsonify({
+            "db": "error",
+            "error": "Cannot read any table. Check SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY.",
+        }), 500
     return jsonify({"db": "connected", "missing": missing})
 
 
+# One shared rate-limit bucket for all three submit endpoints
+submit_limit = limiter.shared_limit("3 per minute; 10 per hour", scope="submit")
+
+
 @app.post("/api/birth/submit")
+@submit_limit
 def birth_submit():
     return submit("birth")
 
 
 @app.post("/api/death/submit")
+@submit_limit
 def death_submit():
     return submit("death")
 
 
 @app.post("/api/marriage/submit")
+@submit_limit
 def marriage_submit():
     return submit("marriage")
 
@@ -351,10 +439,8 @@ def marriage_submit():
 # supply BOTH the control number and the email used on the request, so guessing
 # control numbers gets an attacker nothing. Subject names are masked.
 @app.post("/api/track")
+@limiter.limit("5 per minute; 10 per 15 minutes")
 def track_request():
-    if rate_limited(f"track:{client_ip()}", limit=10, window_seconds=900):
-        return jsonify({"error": "Too many attempts. Please wait a few minutes and try again."}), 429
-
     body = request.get_json(silent=True) or {}
     control_no = (body.get("control_no") or "").strip().upper()
     email = (body.get("email") or "").strip().lower()
@@ -378,7 +464,8 @@ def track_request():
     row = rows[0] if rows else None
     stored = ((row or {}).get("requester_email") or "").strip().lower()
     # Same response whether the number or the email is wrong (no enumeration).
-    if not row or not stored or not hmac.compare_digest(stored, email):
+    # Bytes compare: str compare_digest raises on non-ASCII input.
+    if not row or not stored or not hmac.compare_digest(stored.encode("utf-8"), email.encode("utf-8")):
         return not_found
 
     kind = (row.get("record_type") or "birth").lower()
