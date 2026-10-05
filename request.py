@@ -218,6 +218,30 @@ def mask_name(text):
     return " ".join((w[0] + "***") if len(w) > 1 else w for w in (text or "").split())
 
 
+def build_request_snapshot(kind, row):
+    """Full copy of what the citizen submitted, for the admin notification.
+
+    Mirrors the confirm page the citizen saw (record details, requesting
+    party, signature, verified email) so the admin modal shows the same data
+    even when it falls back to this saved copy. The storage path of the
+    signature is never exposed; only `has_signature` is.
+    """
+    cfg = KINDS[kind]
+    snapshot = {field: row.get(field) for field in cfg["fields"] + COMMON}
+    snapshot.update({
+        "request_id": row.get("id"),
+        "control_no": row.get("control_no"),
+        "record_type": kind,
+        "status": (row.get("status") or "PENDING").upper(),
+        "created_at": row.get("created_at"),
+        "has_signature": bool(row.get("signature_path")),
+        # submit() refuses to save a request unless the email was verified.
+        "email_verified": True,
+        "source": "online_request",
+    })
+    return snapshot
+
+
 def create_request_notification(supabase, row):
     """Insert an admin-bell notification for a newly submitted request."""
     try:
@@ -236,15 +260,7 @@ def create_request_notification(supabase, row):
             "title": f"New {kind.title()} Certificate Request",
             "message": f"New {kind} certificate request (Control No: {control_no}) "
                        f"for {subject or 'N/A'} from {requester}.",
-            "request_snapshot": {
-                "request_id": row.get("id"),
-                "control_no": control_no,
-                "record_type": kind,
-                "requester_name": row.get("requester_name"),
-                "num_copies": row.get("num_copies"),
-                "purposes": row.get("purposes"),
-                "source": "online_request",
-            },
+            "request_snapshot": build_request_snapshot(kind, row),
             "is_read": False,
         }).execute()
     except Exception as e:
@@ -511,7 +527,9 @@ def get_signature(record_type, record_id):
         if not path:
             return jsonify({"error": "Signature not found"}), 404
         raw = supabase.storage.from_(BUCKET).download(path)
-        return Response(raw, mimetype=MIME.get(path.rsplit(".", 1)[-1], "application/octet-stream"))
+        resp = Response(raw, mimetype=MIME.get(path.rsplit(".", 1)[-1], "application/octet-stream"))
+        resp.headers["Cache-Control"] = "private, max-age=300"
+        return resp
     except Exception as e:
         print(f"[request] signature fetch failed: {e}")
         return jsonify({"error": "Could not load signature."}), 500
