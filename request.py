@@ -1,93 +1,47 @@
-import base64
-import calendar
-import datetime
-import hmac
-import os
-import re
-import uuid
+"""
+routes/citizen_requests.py
+---------------------------
+Session-gated management of citizen certificate requests
+(civil_registry_request table). This blueprint belongs to the MAIN app
+(the one with /api/session, /api/logout, is_admin()/get_user_permissions())
+— NOT to backend/request.py, which is a separate, unauthenticated Flask
+process serving the public request website.
+
+NOTIFICATION BEHAVIOR:
+  * Every status change (Being Processed, Completed, Rejected) creates an
+    admin-bell notification with a full request snapshot, so the modal can
+    show the details. Pending Review is the starting state and never notifies.
+  * The citizen is emailed ONLY for Completed and Rejected
+    (see NOTIFY_ON_STATUSES).
+
+NOTE: bell notifications created here are pushed over SSE immediately,
+because this blueprint runs in the same process as routes/notification.py.
+Notifications created by backend/request.py (new submissions) are written to
+the database only, so the bell shows them after a refresh or a poll.
+
+SIGNATURE (detail endpoint):
+  The signature file lives in the private Supabase Storage bucket
+  "signatures". The detail endpoint returns `signature_url`, a short-lived
+  signed URL. The raw storage path (`signature_path`) is never exposed.
+"""
+
+import traceback
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
+from datetime import datetime, timezone
 from functools import wraps
-from zoneinfo import ZoneInfo
 
-from werkzeug.middleware.proxy_fix import ProxyFix
-from dotenv import load_dotenv
-load_dotenv()  # must run BEFORE supabase_client / email_verification are imported
+from flask import Blueprint, request, jsonify, session, Response
 
-from extensions import limiter
-from email_verification import consume_verification, is_email_verified, verification_bp
-from flask import Flask, request, jsonify, Response
-from flask_cors import CORS
 from supabase_client import supabase
+from auth.Rolemanagement import is_admin, get_user_permissions
+from .email_service import send_status_update_email
+from .notification import push_notification
+from logs.Audits import record_action
+from security import audit_denial
 
-app = Flask(__name__)
-app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1)  # one proxy hop (Render)
-limiter.init_app(app)
+citizen_requests_bp = Blueprint("citizen_requests_bp", __name__)
 
-# ── Config (all environment-driven) ──────────────────────────
-# ALLOWED_ORIGINS: comma-separated list of exact origins, e.g.
-#   https://lcr-request.vercel.app,https://lcr-admin.vercel.app
-# Defaults to "*" so local development keeps working, but SET IT in production.
-ALLOWED_ORIGINS = [o.strip() for o in os.environ.get("ALLOWED_ORIGINS", "*").split(",") if o.strip()]
-
-# ALLOWED_ORIGIN_REGEX (optional): lets Vercel preview deployments of THIS project
-# call the API. Every deployment gets a new URL, so exact matching keeps breaking.
-# Example (Render env var):
-#   ^https://client-[a-z0-9]+-joshua-paracuelles-projects\.vercel\.app$
-ORIGIN_REGEX = os.environ.get("ALLOWED_ORIGIN_REGEX", "").strip()
-
-# fail closed in production
-IS_PROD = os.environ.get("APP_ENV") == "production"
-if IS_PROD and ("*" in ALLOWED_ORIGINS or not ALLOWED_ORIGINS):
-    raise RuntimeError("Set ALLOWED_ORIGINS to your real frontend origin(s) in production.")
-
-# ADMIN_API_KEY: required for signature + notification endpoints. If unset,
-# those endpoints are disabled (fail closed) instead of being public.
-ADMIN_API_KEY = os.environ.get("ADMIN_API_KEY")
-DEBUG = os.environ.get("FLASK_DEBUG") == "1"
-
-# Flask-CORS accepts both exact strings and compiled regex patterns.
-CORS_ORIGINS = list(ALLOWED_ORIGINS)
-if ORIGIN_REGEX:
-    CORS_ORIGINS.append(re.compile(ORIGIN_REGEX))
-
-CORS(app, resources={r"/api/*": {"origins": CORS_ORIGINS}})
-app.register_blueprint(verification_bp)  # /api/verify/send, /api/verify/confirm
-
-BUCKET = "signatures"
-MAX_SIG_BYTES = 2 * 1024 * 1024
-app.config["MAX_CONTENT_LENGTH"] = MAX_SIG_BYTES + 512 * 1024  # file + form fields
-EXT = {"image/png": "png", "image/jpeg": "jpg", "image/webp": "webp", "application/pdf": "pdf"}
-MIME = {v: k for k, v in EXT.items()}
-
-# ── Unified table ────────────────────────────────────────────
 REQUEST_TABLE = "civil_registry_request"
-REQUIRED_TABLES = [REQUEST_TABLE, "notification"]
-
-KINDS = {
-    "birth": {
-        "table": REQUEST_TABLE, "prefix": "BR", "key": "birth_request",
-        "fields": ["child_firstname", "child_middlename", "child_surname",
-                   "birth_month", "birth_date", "birth_year", "place_of_birth"],
-        "required": ["child_firstname", "birth_year"],
-    },
-    "death": {
-        "table": REQUEST_TABLE, "prefix": "DR", "key": "death_request",
-        "fields": ["deceased_firstname", "deceased_middlename", "deceased_surname",
-                   "death_month", "death_date", "death_year", "place_of_death"],
-        "required": ["deceased_firstname", "death_year"],
-    },
-    "marriage": {
-        "table": REQUEST_TABLE, "prefix": "MR", "key": "marriage_request",
-        "fields": ["husband_fullname", "wife_maiden_name", "marriage_date", "place_of_marriage"],
-        "required": ["husband_fullname", "wife_maiden_name"],
-    },
-}
-COMMON = ["num_copies", "purposes", "form_type",
-          "requester_name", "requester_relationship", "requester_address", "requester_telephone",
-          "requester_email",
-          "registry_no", "date_of_registration", "book", "page", "search_by",
-          "signature_printed_name"]
-# requester_email is enforced server-side too (the form already requires it).
-ALWAYS_REQUIRED = ["requester_name", "requester_relationship", "requester_address", "requester_email"]
 
 STATUS_ORDER = ["PENDING", "PROCESSING", "COMPLETED"]
 STATUS_LABELS = {
@@ -96,497 +50,385 @@ STATUS_LABELS = {
     "COMPLETED": "Completed",
     "REJECTED": "Rejected",
 }
+ALL_STATUSES = list(STATUS_LABELS.keys())
 
-# NOTE (migration): assumes civil_registry_request has an
-# `updated_at timestamptz` column (nullable is fine), and that the
-# `email_verification` table from email_verification.sql exists.
+# Valid values for the "notify_via" field the frontend sends. Anything
+# else falls back to "email".
+VALID_NOTIFY_VIA = {"email", "none"}
 
-# ── Validation patterns (mirror the frontend) ────────────────
-EMAIL_RE = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
-# stricter PH mobile numbers
-PH_LOCAL_RE = re.compile(r"^09\d{9}$")
-PH_INTL_RE = re.compile(r"^\+639\d{9}$")
+# The citizen is emailed ONLY when a request is completed or rejected.
+# Change this set to add PROCESSING if you want emails for that status too.
+NOTIFY_ON_STATUSES = {"COMPLETED", "REJECTED"}
+
+# Admin bell: any real status change creates a notification.
+BELL_ON_STATUSES = {"PROCESSING", "COMPLETED", "REJECTED"}
+
+# Columns never copied into a notification snapshot.
+SNAPSHOT_EXCLUDE = {"signature_path"}
+
+# Permission key the frontend checks via hasAccess("citizen_requests").
+REQUIRED_PERMISSION = "citizen_requests"
+
+# Max time (seconds) to wait for the email before giving up on it.
+NOTIFY_TIMEOUT_SECONDS = 15
+
+# Private bucket written by backend/request.py.
+SIGNATURE_BUCKET = "signatures"
+SIGNATURE_URL_TTL_SECONDS = 3600
+SIGNATURE_MIME = {
+    "png": "image/png",
+    "jpg": "image/jpeg",
+    "jpeg": "image/jpeg",
+    "webp": "image/webp",
+    "pdf": "application/pdf",
+}
 
 
-# ── Helpers ──────────────────────────────────────────────────
-def clean(v):
-    """Trim strings; empty string -> None (Postgres rejects '' for date columns)."""
-    if isinstance(v, str):
-        return v.strip() or None
-    return v
+def get_user():
+    return session.get("username", "System")
 
 
-# control-number fallback now uses Manila time (the DB trigger is the primary path)
-def gen_control(prefix, record_id):
-    today = datetime.datetime.now(ZoneInfo("Asia/Manila"))
-    return f"{prefix}-{today:%Y%m%d}-{record_id:05d}"
-
-
-def admin_required(fn):
+def _staff_required(fn):
+    """Allows an admin unconditionally, or a non-admin whose permission list
+    includes REQUIRED_PERMISSION."""
     @wraps(fn)
     def wrapper(*args, **kwargs):
-        if not ADMIN_API_KEY:
-            return jsonify({"error": "Admin endpoints are disabled."}), 503
-        # bytes compare (str compare_digest raises on non-ASCII input)
-        supplied = request.headers.get("X-Admin-Key", "").encode("utf-8")
-        if not hmac.compare_digest(supplied, ADMIN_API_KEY.encode("utf-8")):
-            return jsonify({"error": "Unauthorized"}), 401
-        return fn(*args, **kwargs)
+        username = session.get("username")
+        if not username:
+            audit_denial("Citizen request route requires authentication")
+            return jsonify({"error": "Not logged in"}), 401
+        if is_admin(username):
+            return fn(*args, **kwargs)
+        perms = get_user_permissions(username) or []
+        if REQUIRED_PERMISSION in perms or "*" in perms:
+            return fn(*args, **kwargs)
+        audit_denial("Citizen request permission required")
+        return jsonify({"error": "Forbidden"}), 403
     return wrapper
 
 
-@app.errorhandler(413)
-def too_large(_e):
-    return jsonify({"error": "Upload is too large. The signature file must be 2 MB or smaller."}), 413
-
-
-@app.errorhandler(429)
-def rate_limit_hit(_e):
-    return jsonify({"error": "Too many requests. Please slow down and try again shortly."}), 429
-
-
-# ── Signature handling ───────────────────────────────────────
-class SignatureError(ValueError):
-    """Raised when an uploaded signature is present but not acceptable."""
-
-
-def sniff_mime(raw):
-    """Detect the real type from magic bytes; never trust the client's header."""
-    if raw.startswith(b"\x89PNG\r\n\x1a\n"):
-        return "image/png"
-    if raw[:3] == b"\xff\xd8\xff":
-        return "image/jpeg"
-    if raw[:4] == b"RIFF" and raw[8:12] == b"WEBP":
-        return "image/webp"
-    if raw[:5] == b"%PDF-":
-        return "application/pdf"
-    return None
-
-
-def validate_signature_bytes(raw):
-    if len(raw) > MAX_SIG_BYTES:
-        raise SignatureError("Signature file must be 2 MB or smaller.")
-    mime = sniff_mime(raw)
-    if not mime:
-        raise SignatureError("Signature must be a PNG, JPG or WEBP image, or a PDF.")
-    return raw, mime
-
-
-def decode_signature_b64(sig):
-    """Legacy JSON path. Returns (bytes, mime) or (None, None) if none was sent.
-    Raises SignatureError if something was sent but is unusable."""
-    if not sig:
-        return None, None
-    try:
-        if sig.startswith("data:"):
-            sig = sig.split(",", 1)[1]
-        raw = base64.b64decode(sig, validate=True)
-    except Exception:
-        raise SignatureError("Signature data is not valid base64.")
-    return validate_signature_bytes(raw)
-
-
-def extract_signature_from_upload(file_storage):
-    """Multipart path. Returns (bytes, mime) or (None, None) if no file was chosen.
-    Raises SignatureError if a file was sent but is unusable."""
-    if not file_storage or not file_storage.filename:
-        return None, None
-    raw = file_storage.read(MAX_SIG_BYTES + 1)
-    if not raw:
-        raise SignatureError("The uploaded signature file is empty.")
-    return validate_signature_bytes(raw)
-
-
-def store_signature(kind, raw, mime):
-    if not raw:
-        return None
-    path = f"{kind}/{uuid.uuid4().hex}.{EXT[mime]}"
-    supabase.storage.from_(BUCKET).upload(path, raw, {"content-type": mime})
-    return path
-
-
-# ── Display helpers ──────────────────────────────────────────
-def subject_of(kind, r):
+def who(kind, r):
     if kind == "marriage":
-        return f"{r.get('husband_fullname') or ''} & {r.get('wife_maiden_name') or ''}".strip()
+        return f"{r.get('husband_fullname')} & {r.get('wife_maiden_name')}"
     p = "child" if kind == "birth" else "deceased"
     return f"{r.get(p + '_firstname') or ''} {r.get(p + '_surname') or ''}".strip()
 
 
-def mask_name(text):
-    """'Juan Dela Cruz' -> 'J*** D*** C***' (privacy-safe display)."""
-    return " ".join((w[0] + "***") if len(w) > 1 else w for w in (text or "").split())
-
-
-def build_request_snapshot(kind, row):
-    """Full copy of what the citizen submitted, for the admin notification.
-
-    Mirrors the confirm page the citizen saw (record details, requesting
-    party, signature, verified email) so the admin modal shows the same data
-    even when it falls back to this saved copy. The storage path of the
-    signature is never exposed; only `has_signature` is.
-    """
-    cfg = KINDS[kind]
-    snapshot = {field: row.get(field) for field in cfg["fields"] + COMMON}
-    snapshot.update({
-        "request_id": row.get("id"),
-        "control_no": row.get("control_no"),
-        "record_type": kind,
-        "status": (row.get("status") or "PENDING").upper(),
-        "created_at": row.get("created_at"),
-        "has_signature": bool(row.get("signature_path")),
-        # submit() refuses to save a request unless the email was verified.
-        "email_verified": True,
-        "source": "online_request",
-    })
-    return snapshot
-
-
-def create_request_notification(supabase, row):
-    """Insert an admin-bell notification for a newly submitted request."""
+def _signed_signature_url(path):
+    """Short-lived signed URL for a file in the private signatures bucket.
+    Returns None (never raises) if the file is missing or signing fails."""
+    if not path:
+        return None
     try:
-        kind = (row.get("record_type") or "").lower()
-        if kind not in KINDS:
-            return None
-
-        subject = subject_of(kind, row)
-        control_no = row.get("control_no")
-        requester = row.get("requester_name") or "a citizen"
-
-        supabase.table("notification").insert({
-            "record_type": kind,
-            "record_id": row.get("id"),
-            "control_no": control_no,
-            "title": f"New {kind.title()} Certificate Request",
-            "message": f"New {kind} certificate request (Control No: {control_no}) "
-                       f"for {subject or 'N/A'} from {requester}.",
-            "request_snapshot": build_request_snapshot(kind, row),
-            "is_read": False,
-        }).execute()
+        res = supabase.storage.from_(SIGNATURE_BUCKET).create_signed_url(
+            path, SIGNATURE_URL_TTL_SECONDS
+        )
+        return (res or {}).get("signedURL") or (res or {}).get("signedUrl")
     except Exception as e:
-        print(f"[request] notification insert failed (ignored): {e}")
+        print(f"[citizen_requests] could not sign signature URL for {path}: {e}")
         return None
 
 
-def get_incoming_fields(kind):
-    """Reads submitted data from JSON (legacy) or multipart/form-data.
-    Returns (data_dict, uploaded_file_or_None)."""
-    if (request.content_type or "").startswith("multipart/form-data"):
-        return request.form.to_dict(), request.files.get("signature")
-    body = request.get_json(silent=True) or {}
-    return (body.get(KINDS[kind]["key"], {}) or {}), None
+def _send_email_notification(to_email, subject, body):
+    """Send the status-update email in a worker thread, with a hard timeout.
+    Returns a plain boolean. NEVER raises."""
+    executor = ThreadPoolExecutor(max_workers=1)
+    future = executor.submit(
+        send_status_update_email,
+        to_email=to_email,
+        subject=subject,
+        body=body,
+    )
 
-
-def validate_row(row):
-    """Server-side mirror of the frontend rules. Returns {field: message}."""
-    errs = {}
-    email = row.get("requester_email")
-    if email and not EMAIL_RE.match(email):
-        errs["requester_email"] = "Enter a valid email address."
-    phone = row.get("requester_telephone")
-    if phone and not (PH_LOCAL_RE.match(phone) or PH_INTL_RE.match(phone)):
-        errs["requester_telephone"] = "Enter a valid mobile number (09XXXXXXXXX or +639XXXXXXXXX)."
-    return errs
-
-
-# ── Date + length validation (mirrors the frontend) ──────────
-MONTH_NAMES = [m.lower() for m in calendar.month_name if m]
-
-
-def parse_month(v):
-    s = (v or "").strip().lower().rstrip(".")
-    if s.isdigit():
-        return int(s) if 1 <= int(s) <= 12 else 0
-    if len(s) >= 3:
-        for i, name in enumerate(MONTH_NAMES, 1):
-            if name.startswith(s):
-                return i
-    return 0  # invalid
-
-
-def validate_dates(kind, row):
-    if kind == "marriage":
-        return {}
-    p = kind  # "birth" | "death"
-    yk, mk, dk = f"{p}_year", f"{p}_month", f"{p}_date"
-    today = datetime.datetime.now(ZoneInfo("Asia/Manila")).date()
-    errs, year, month, day = {}, 0, 0, 0
-    y, m, d = row.get(yk), row.get(mk), row.get(dk)
-    if y:
-        if re.fullmatch(r"\d{4}", y) and 1850 <= int(y) <= today.year:
-            year = int(y)
-        else:
-            errs[yk] = f"Enter a valid 4-digit year (1850-{today.year})."
-    if m:
-        month = parse_month(m)
-        if not month:
-            errs[mk] = "Enter a valid month."
-    if d:
-        if re.fullmatch(r"\d{1,2}", d) and 1 <= int(d) <= 31:
-            day = int(d)
-        else:
-            errs[dk] = "Enter a valid day (1-31)."
-    if year and month and day:
-        try:
-            if datetime.date(year, month, day) > today:
-                errs[dk] = "Date cannot be in the future."
-        except ValueError:
-            errs[dk] = "That date does not exist."
-    elif year and month and datetime.date(year, month, 1) > today:
-        errs[mk] = "Date cannot be in the future."
-    return errs
-
-
-MAX_FIELD_LEN = 255
-
-
-def validate_lengths(row):
-    return {k: "Too long." for k, v in row.items()
-            if isinstance(v, str) and len(v) > MAX_FIELD_LEN}
-
-
-# ── Submit ───────────────────────────────────────────────────
-def submit(kind):
-    cfg = KINDS[kind]
-    data, uploaded_file = get_incoming_fields(kind)
-
-    row = {f: clean(data.get(f)) for f in cfg["fields"] + COMMON}
-    row["status"] = "PENDING"
-    row["record_type"] = kind
-
-    # Explicit consent must be sent by the form (enforced server-side, not just in the UI).
-    if str(data.get("consent", "")).strip().lower() not in ("true", "1", "yes"):
-        return jsonify({"error": "Consent to the Privacy Policy is required to submit a request."}), 400
-
-    missing = [f for f in cfg["required"] + ALWAYS_REQUIRED if not row.get(f)]
-    if missing:
-        return jsonify({"error": f"Missing required field(s): {', '.join(missing)}"}), 400
-
-    field_errors = {**validate_lengths(row), **validate_row(row), **validate_dates(kind, row)}
-    if field_errors:
-        return jsonify({"error": " ".join(field_errors.values()), "fields": field_errors}), 400
-
-    # Store emails lowercase so tracking and verification always compare the same value.
-    row["requester_email"] = row["requester_email"].lower()
-
-    # The requester's email must have been verified with a one-time code.
-    if not is_email_verified(row["requester_email"], data.get("verification_token")):
-        return jsonify({
-            "error": "Please verify your email address before submitting your request.",
-            "code": "EMAIL_NOT_VERIFIED",
-        }), 403
-
-    # Invalid signatures are rejected loudly instead of silently dropped.
+    sent = False
     try:
-        if uploaded_file is not None:
-            raw, mime = extract_signature_from_upload(uploaded_file)
-        else:
-            raw, mime = decode_signature_b64(data.get("signature_base64"))
-    except SignatureError as e:
-        return jsonify({"error": str(e)}), 400
-
-    sig_path = None
-    record_id = None
-    try:
-        sig_path = store_signature(kind, raw, mime)
-        row["signature_path"] = sig_path
-        # single insert (DB trigger assigns control_no)
-        rec = supabase.table(cfg["table"]).insert(row).execute().data[0]
-        record_id = rec["id"]
-        control_no = rec.get("control_no")
-        if not control_no:  # trigger not installed yet: old behaviour
-            control_no = gen_control(cfg["prefix"], record_id)
-            supabase.table(cfg["table"]).update({"control_no": control_no}).eq("id", record_id).execute()
+        sent = bool(future.result(timeout=NOTIFY_TIMEOUT_SECONDS))
+    except FuturesTimeout:
+        print(
+            f"[citizen_requests] email notification did not finish within "
+            f"{NOTIFY_TIMEOUT_SECONDS}s, giving up on it (status update is unaffected)."
+        )
     except Exception as e:
-        print(f"[request] submit failed, rolling back: {e}")
-        # Roll back so a retry can't create duplicates / orphaned files.
-        if record_id is not None:
-            try:
-                supabase.table(cfg["table"]).delete().eq("id", record_id).execute()
-            except Exception as e2:
-                print(f"[request] rollback (row delete) failed: {e2}")
-        if sig_path:
-            try:
-                supabase.storage.from_(BUCKET).remove([sig_path])
-            except Exception as e2:
-                print(f"[request] rollback (file delete) failed: {e2}")
-        return jsonify({"error": "We couldn't save your request. Please try again."}), 500
+        print(f"[citizen_requests] email notification raised: {e}")
+        traceback.print_exc()
 
-    # One verification = one submission.
-    consume_verification(row["requester_email"])
-
-    create_request_notification(supabase, {**row, **rec, "control_no": control_no})
-
-    return jsonify({"record_id": record_id, "control_no": control_no,
-                    "has_signature": sig_path is not None})
+    executor.shutdown(wait=False)
+    return sent
 
 
-# ── Health ───────────────────────────────────────────────────
-@app.get("/api/health")
-@limiter.exempt
-def health():
-    missing = []
-    for t in REQUIRED_TABLES + ["email_verification"]:
-        try:
-            supabase.table(t).select("*").limit(1).execute()
-        except Exception:
-            missing.append(t)
-    if len(missing) >= len(REQUIRED_TABLES) + 1:
-        return jsonify({
-            "db": "error",
-            "error": "Cannot read any table. Check SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY.",
-        }), 500
-    return jsonify({"db": "connected", "missing": missing})
+def _safe_record_action(*args, **kwargs):
+    """Audit logging is nice-to-have; it must never fail the request."""
+    try:
+        record_action(*args, **kwargs)
+    except Exception as e:
+        print(f"[citizen_requests] record_action failed (ignored): {e}")
+        traceback.print_exc()
 
 
-# One shared rate-limit bucket for all three submit endpoints
-submit_limit = limiter.shared_limit("3 per minute; 10 per hour", scope="submit")
+def build_status_snapshot(kind, row, new_status, updated_at):
+    """Copy of the request as it looks after the status change, for the bell
+    modal. The signature storage path is never included; only has_signature."""
+    snap = {k: v for k, v in row.items() if k not in SNAPSHOT_EXCLUDE}
+    snap.update({
+        "request_id": row.get("id"),
+        "record_type": kind,
+        "status": new_status,
+        "updated_at": updated_at,
+        "has_signature": bool(row.get("signature_path")),
+        "email_verified": bool(row.get("requester_email")),
+        "source": "status_update",
+    })
+    return snap
 
 
-@app.post("/api/birth/submit")
-@submit_limit
-def birth_submit():
-    return submit("birth")
+def notify_bell(kind, record_id, control_no, new_status, status_label, note, snapshot):
+    """Create an admin-bell notification for a status change.
+    push_notification never raises, so a bell problem can't fail the update."""
+    message = f"{kind.title()} request {control_no} is now {status_label}."
+    if note:
+        message += f" Remark: {note}"
+
+    push_notification(
+        record_type=kind,
+        record_id=record_id,
+        control_no=control_no,
+        title=f"Request {status_label}",
+        message=message,
+        request_snapshot=snapshot,
+    )
 
 
-@app.post("/api/death/submit")
-@submit_limit
-def death_submit():
-    return submit("death")
-
-
-@app.post("/api/marriage/submit")
-@submit_limit
-def marriage_submit():
-    return submit("marriage")
-
-
-# ── PUBLIC TRACKING ──────────────────────────────────────────
-# POST /api/track so the email never appears in URLs/logs. The citizen must
-# supply BOTH the control number and the email used on the request, so guessing
-# control numbers gets an attacker nothing. Subject names are masked.
-@app.post("/api/track")
-@limiter.limit("5 per minute; 10 per 15 minutes")
-def track_request():
-    body = request.get_json(silent=True) or {}
-    control_no = (body.get("control_no") or "").strip().upper()
-    email = (body.get("email") or "").strip().lower()
-    if not control_no or not email:
-        return jsonify({"error": "Control number and email are required."}), 400
-
-    not_found = (jsonify({"error": "No request matches that control number and email."}), 404)
+@citizen_requests_bp.route("/api/requests", methods=["GET"])
+@_staff_required
+def list_citizen_requests():
+    record_type = request.args.get("type", "").strip().lower()
+    status = request.args.get("status", "").strip().upper()
+    search = request.args.get("search", "").strip()
+    limit = min(max(request.args.get("limit", 50, type=int), 1), 200)
+    offset = max(request.args.get("offset", 0, type=int), 0)
 
     try:
-        rows = supabase.table(REQUEST_TABLE).select(
-            "id, record_type, control_no, status, created_at, updated_at, "
-            "num_copies, requester_email, "
+        query = supabase.table(REQUEST_TABLE).select(
+            "id, record_type, control_no, status, num_copies, purposes, "
+            "requester_name, requester_relationship, requester_telephone, "
+            "created_at, updated_at, "
             "child_firstname, child_surname, "
             "deceased_firstname, deceased_surname, "
-            "husband_fullname, wife_maiden_name"
-        ).eq("control_no", control_no).limit(1).execute().data
+            "husband_fullname, wife_maiden_name",
+            count="exact",
+        )
+
+        if record_type in ("birth", "death", "marriage"):
+            query = query.eq("record_type", record_type)
+        if status in ALL_STATUSES:
+            query = query.eq("status", status)
+        if search:
+            safe = search.replace(",", " ").replace("(", " ").replace(")", " ")
+            query = query.or_(
+                f"control_no.ilike.%{safe}%,requester_name.ilike.%{safe}%,"
+                f"child_firstname.ilike.%{safe}%,child_surname.ilike.%{safe}%,"
+                f"deceased_firstname.ilike.%{safe}%,deceased_surname.ilike.%{safe}%,"
+                f"husband_fullname.ilike.%{safe}%,wife_maiden_name.ilike.%{safe}%"
+            )
+
+        res = (
+            query.order("created_at", desc=True)
+            .order("id", desc=True)
+            .range(offset, offset + limit - 1)
+            .execute()
+        )
+
+        rows = res.data or []
+        for r in rows:
+            kind = (r.get("record_type") or "birth").lower()
+            r["who"] = who(kind, r)
+            st = (r.get("status") or "PENDING").upper()
+            r["status_label"] = STATUS_LABELS.get(st, st)
+
+        return jsonify({"total": res.count or 0, "requests": rows})
     except Exception as e:
-        print(f"[request] track failed: {e}")
-        return jsonify({"error": "Something went wrong. Please try again."}), 500
-
-    row = rows[0] if rows else None
-    stored = ((row or {}).get("requester_email") or "").strip().lower()
-    # Same response whether the number or the email is wrong (no enumeration).
-    # Bytes compare: str compare_digest raises on non-ASCII input.
-    if not row or not stored or not hmac.compare_digest(stored.encode("utf-8"), email.encode("utf-8")):
-        return not_found
-
-    kind = (row.get("record_type") or "birth").lower()
-    status = (row.get("status") or "PENDING").upper()
-    return jsonify({
-        "control_no": row.get("control_no"),
-        "record_type": kind,
-        "subject": mask_name(subject_of(kind, row)),
-        "num_copies": row.get("num_copies"),
-        "status": status,
-        "status_label": STATUS_LABELS.get(status, status),
-        "is_rejected": status == "REJECTED",
-        "submitted_at": row.get("created_at"),
-        "updated_at": row.get("updated_at"),
-        "steps": STATUS_ORDER,
-        "step_labels": [STATUS_LABELS[s] for s in STATUS_ORDER],
-        "current_step_index": STATUS_ORDER.index(status) if status in STATUS_ORDER else -1,
-    })
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
 
 
-# ── ADMIN-ONLY (require header  X-Admin-Key: <ADMIN_API_KEY>) ─
-@app.get("/api/<string:record_type>/<int:record_id>/signature")
-@admin_required
-def get_signature(record_type, record_id):
-    cfg = KINDS.get(record_type)
-    if not cfg:
-        return jsonify({"error": "Invalid record type"}), 400
+@citizen_requests_bp.route("/api/requests/<int:record_id>", methods=["GET"])
+@_staff_required
+def get_citizen_request_detail(record_id):
     try:
-        rows = (supabase.table(cfg["table"]).select("signature_path")
-                .eq("id", record_id).eq("record_type", record_type).limit(1).execute().data)
-        path = rows[0]["signature_path"] if rows else None
+        rows = supabase.table(REQUEST_TABLE).select("*").eq("id", record_id).limit(1).execute().data
+        if not rows:
+            return jsonify({"error": "Request not found"}), 404
+        row = rows[0]
+
+        # Read signature_path BEFORE popping it.
+        signature_path = row.pop("signature_path", None)
+        has_signature = bool(signature_path)
+
+        kind = (row.get("record_type") or "birth").lower()
+        row["who"] = who(kind, row)
+        st = (row.get("status") or "PENDING").upper()
+        row["status_label"] = STATUS_LABELS.get(st, st)
+        row["has_signature"] = has_signature
+        row["signature_url"] = _signed_signature_url(signature_path)
+        row["email_verified"] = bool(row.get("requester_email"))
+        return jsonify(row)
+    except Exception as e:
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+
+
+@citizen_requests_bp.route("/api/requests/<int:record_id>/signature", methods=["GET"])
+@_staff_required
+def get_citizen_request_signature(record_id):
+    """Serves the signature file for the admin modal's <img>. Session-gated,
+    so the browser's login cookie is enough. The file is read from the
+    private bucket."""
+    try:
+        rows = (
+            supabase.table(REQUEST_TABLE)
+            .select("signature_path")
+            .eq("id", record_id)
+            .limit(1)
+            .execute()
+            .data
+        )
+        path = rows[0].get("signature_path") if rows else None
         if not path:
             return jsonify({"error": "Signature not found"}), 404
-        raw = supabase.storage.from_(BUCKET).download(path)
-        resp = Response(raw, mimetype=MIME.get(path.rsplit(".", 1)[-1], "application/octet-stream"))
+
+        raw = supabase.storage.from_(SIGNATURE_BUCKET).download(path)
+        ext = path.rsplit(".", 1)[-1].lower()
+        resp = Response(raw, mimetype=SIGNATURE_MIME.get(ext, "application/octet-stream"))
         resp.headers["Cache-Control"] = "private, max-age=300"
         return resp
     except Exception as e:
-        print(f"[request] signature fetch failed: {e}")
+        print(f"[citizen_requests] signature fetch failed for request {record_id}: {e}")
+        traceback.print_exc()
         return jsonify({"error": "Could not load signature."}), 500
 
 
-@app.get("/api/notifications")
-@admin_required
-def get_notifications():
+@citizen_requests_bp.route("/api/requests/<int:record_id>/status", methods=["PATCH"])
+@_staff_required
+def update_citizen_request_status(record_id):
+    data = request.get_json(silent=True) or {}
+    new_status = (data.get("status") or "").strip().upper()
+    note = (data.get("note") or "").strip() or None
+
+    notify_via = (data.get("notify_via") or "").strip().lower()
+    if notify_via not in VALID_NOTIFY_VIA:
+        notify_via = "email"
+
+    if new_status not in ALL_STATUSES:
+        return jsonify({"error": f"Invalid status. Must be one of: {', '.join(ALL_STATUSES)}"}), 400
+    if new_status == "REJECTED" and not note:
+        return jsonify({"error": "A remark is required when rejecting a request."}), 400
+
     try:
-        res = (supabase.table("notification").select("*")
-               .order("created_at", desc=True).limit(100).execute())
-        return jsonify(res.data)
+        rows = supabase.table(REQUEST_TABLE).select("*").eq("id", record_id).limit(1).execute().data
+        if not rows:
+            return jsonify({"error": "Request not found"}), 404
+        row = rows[0]
+        kind = (row.get("record_type") or "birth").lower()
+        old_status = (row.get("status") or "PENDING").upper()
+
+        if old_status == new_status:
+            return jsonify({"error": f"Request is already {STATUS_LABELS.get(new_status, new_status)}."}), 400
+        if old_status in ("COMPLETED", "REJECTED"):
+            return jsonify({
+                "error": f"This request is already {STATUS_LABELS.get(old_status, old_status)} and can no longer be changed."
+            }), 400
+
+        # 1. Save the new status. This is the only step that can fail the request.
+        now_iso = datetime.now(timezone.utc).isoformat()
+        try:
+            supabase.table(REQUEST_TABLE).update({
+                "status": new_status,
+                "updated_at": now_iso,
+            }).eq("id", record_id).execute()
+        except Exception as db_err:
+            print(f"[citizen_requests] Could not save status for request {record_id}: {db_err}")
+            traceback.print_exc()
+            return jsonify({"error": f"Could not save the new status: {db_err}"}), 500
+
+        status_label = STATUS_LABELS.get(new_status, new_status)
+        control_no = row.get("control_no")
+
+        # 2. Admin bell notification (best-effort, never raises).
+        if new_status in BELL_ON_STATUSES:
+            snapshot = build_status_snapshot(kind, row, new_status, now_iso)
+            notify_bell(
+                kind=kind,
+                record_id=record_id,
+                control_no=control_no,
+                new_status=new_status,
+                status_label=status_label,
+                note=note,
+                snapshot=snapshot,
+            )
+
+        # 3. Citizen email (Completed / Rejected only), with a hard timeout.
+        if new_status == "REJECTED":
+            message = (
+                f"We're sorry, but your {kind} certificate request "
+                f"(Control No: {control_no}) has been rejected."
+            )
+            if note:
+                message += f"\n\nRemark: {note}"
+            message += "\n\nIf you have questions, please contact the Local Civil Registry."
+        else:
+            message = f"Your {kind} certificate request (Control No: {control_no}) is now: {status_label}."
+            if note:
+                message += f" Remark: {note}"
+
+        requester_email = row.get("requester_email")
+        status_triggers_email = new_status in NOTIFY_ON_STATUSES
+        email_attempted = notify_via == "email" and status_triggers_email
+
+        if email_attempted:
+            email_sent = _send_email_notification(
+                to_email=requester_email,
+                subject=f"{kind.title()} Certificate Request — {status_label}",
+                body=message,
+            )
+        else:
+            email_sent = False
+
+        email_skipped = notify_via != "none" and not status_triggers_email
+
+        # 4. Audit log (best-effort).
+        _safe_record_action(
+            "REQUEST_STATUS_UPDATE",
+            f"Updated {kind} request {control_no} from {old_status} to {new_status}",
+            username=get_user(),
+            meta={
+                "record_id": record_id,
+                "control_no": control_no,
+                "old_status": old_status,
+                "new_status": new_status,
+                "note": note,
+                "notify_via": notify_via,
+                "email_sent": email_sent,
+                "email_attempted": email_attempted,
+                "email_skipped": email_skipped,
+            },
+            ip=request.remote_addr,
+        )
+
+        return jsonify({
+            "ok": True,
+            "record_id": record_id,
+            "control_no": control_no,
+            "old_status": old_status,
+            "status": new_status,
+            "status_label": status_label,
+            "updated_at": now_iso,
+            "notify_via": notify_via,
+            "email_sent": email_sent,
+            "email_attempted": email_attempted,
+            "email_skipped": email_skipped,
+            "notified_email": requester_email if email_sent else None,
+            "message": f"Status updated to {status_label}",
+        })
     except Exception as e:
-        print(f"[request] notifications failed: {e}")
-        return jsonify({"error": "Could not load notifications."}), 500
-
-
-@app.get("/api/notifications/unread-count")
-@admin_required
-def unread_count():
-    try:
-        res = supabase.table("notification").select("id", count="exact").eq("is_read", False).execute()
-        return jsonify({"count": res.count})
-    except Exception as e:
-        print(f"[request] unread-count failed: {e}")
-        return jsonify({"error": "Could not load count."}), 500
-
-
-def _read_patch(read_by):
-    return {"is_read": True, "read_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-            "read_by": read_by}
-
-
-@app.patch("/api/notifications/<int:notif_id>/read")
-@admin_required
-def mark_read(notif_id):
-    read_by = (request.get_json(silent=True) or {}).get("read_by")
-    try:
-        supabase.table("notification").update(_read_patch(read_by)).eq("id", notif_id).execute()
-        return jsonify({"ok": True})
-    except Exception as e:
-        print(f"[request] mark_read failed: {e}")
-        return jsonify({"error": "Could not update notification."}), 500
-
-
-@app.patch("/api/notifications/mark-all-read")
-@admin_required
-def mark_all_read():
-    read_by = (request.get_json(silent=True) or {}).get("read_by")
-    try:
-        supabase.table("notification").update(_read_patch(read_by)).eq("is_read", False).execute()
-        return jsonify({"ok": True})
-    except Exception as e:
-        print(f"[request] mark_all_read failed: {e}")
-        return jsonify({"error": "Could not update notifications."}), 500
-
-
-if __name__ == "__main__":
-    # Debugger only when explicitly enabled:  FLASK_DEBUG=1 python backend/request.py
-    app.run(host="0.0.0.0", port=5001, debug=DEBUG)
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
