@@ -13,7 +13,7 @@ from dotenv import load_dotenv
 load_dotenv()  # must run BEFORE supabase_client / email_verification are imported
 
 from extensions import limiter
-from email_verification import consume_verification, is_email_verified, verification_bp
+from email_verification import claim_verification, verification_bp
 from flask import Flask, request, jsonify, Response
 from flask_cors import CORS
 from supabase_client import supabase
@@ -29,8 +29,7 @@ limiter.init_app(app)
 ALLOWED_ORIGINS = [o.strip() for o in os.environ.get("ALLOWED_ORIGINS", "*").split(",") if o.strip()]
 
 # ALLOWED_ORIGIN_REGEX (optional): lets Vercel preview deployments of THIS project
-# call the API. Every deployment gets a new URL, so exact matching keeps breaking.
-# Example (Render env var):
+# call the API. Example (Render env var):
 #   ^https://client-[a-z0-9]+-joshua-paracuelles-projects\.vercel\.app$
 ORIGIN_REGEX = os.environ.get("ALLOWED_ORIGIN_REGEX", "").strip()
 
@@ -99,7 +98,7 @@ STATUS_LABELS = {
 
 # NOTE (migration): assumes civil_registry_request has an
 # `updated_at timestamptz` column (nullable is fine), and that the
-# `email_verification` table from email_verification.sql exists.
+# `email_verification` table and bump_verification_attempts() function exist.
 
 # ── Validation patterns (mirror the frontend) ────────────────
 EMAIL_RE = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
@@ -116,7 +115,7 @@ def clean(v):
     return v
 
 
-# control-number fallback now uses Manila time (the DB trigger is the primary path)
+# control-number fallback uses Manila time (the DB trigger is the primary path)
 def gen_control(prefix, record_id):
     today = datetime.datetime.now(ZoneInfo("Asia/Manila"))
     return f"{prefix}-{today:%Y%m%d}-{record_id:05d}"
@@ -220,12 +219,7 @@ def mask_name(text):
 
 def build_request_snapshot(kind, row):
     """Full copy of what the citizen submitted, for the admin notification.
-
-    Mirrors the confirm page the citizen saw (record details, requesting
-    party, signature, verified email) so the admin modal shows the same data
-    even when it falls back to this saved copy. The storage path of the
-    signature is never exposed; only `has_signature` is.
-    """
+    The storage path of the signature is never exposed; only `has_signature` is."""
     cfg = KINDS[kind]
     snapshot = {field: row.get(field) for field in cfg["fields"] + COMMON}
     snapshot.update({
@@ -369,8 +363,8 @@ def submit(kind):
     # Store emails lowercase so tracking and verification always compare the same value.
     row["requester_email"] = row["requester_email"].lower()
 
-    # The requester's email must have been verified with a one-time code.
-    if not is_email_verified(row["requester_email"], data.get("verification_token")):
+    # Atomically consume the verification token. Only one submit can win it.
+    if not claim_verification(row["requester_email"], data.get("verification_token")):
         return jsonify({
             "error": "Please verify your email address before submitting your request.",
             "code": "EMAIL_NOT_VERIFIED",
@@ -412,9 +406,6 @@ def submit(kind):
                 print(f"[request] rollback (file delete) failed: {e2}")
         return jsonify({"error": "We couldn't save your request. Please try again."}), 500
 
-    # One verification = one submission.
-    consume_verification(row["requester_email"])
-
     create_request_notification(supabase, {**row, **rec, "control_no": control_no})
 
     return jsonify({"record_id": record_id, "control_no": control_no,
@@ -422,9 +413,17 @@ def submit(kind):
 
 
 # ── Health ───────────────────────────────────────────────────
+@app.get("/healthz")
+@limiter.exempt
+def healthz():
+    """Cheap liveness check for the load balancer. No database call."""
+    return {"status": "ok"}, 200
+
+
 @app.get("/api/health")
 @limiter.exempt
 def health():
+    """Manual diagnostics. Checks each table; don't point the load balancer here."""
     missing = []
     for t in REQUIRED_TABLES + ["email_verification"]:
         try:
@@ -465,8 +464,9 @@ def marriage_submit():
 # POST /api/track so the email never appears in URLs/logs. The citizen must
 # supply BOTH the control number and the email used on the request, so guessing
 # control numbers gets an attacker nothing. Subject names are masked.
+# Limits are per IP. Offices often share one NAT IP, so keep them generous.
 @app.post("/api/track")
-@limiter.limit("5 per minute; 10 per 15 minutes")
+@limiter.limit("20 per minute; 60 per 15 minutes")
 def track_request():
     body = request.get_json(silent=True) or {}
     control_no = (body.get("control_no") or "").strip().upper()

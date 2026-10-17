@@ -5,8 +5,8 @@
 Flow
   1. POST /api/verify/send    {email}        -> emails a 6-digit code (10 min)
   2. POST /api/verify/confirm {email, code}  -> returns a one-time verification_token (30 min)
-  3. The submit endpoints call is_email_verified(email, token) before saving a
-     request, then consume_verification(email) so the token cannot be reused.
+  3. The submit endpoints call claim_verification(email, token). It atomically
+     consumes the token, so one verification allows exactly one submission.
 
 Only HMAC hashes of the code and token are stored, never the raw values.
 
@@ -86,6 +86,13 @@ def _digest(purpose, email, value):
     return hmac.new(_secret().encode("utf-8"), msg, hashlib.sha256).hexdigest()
 
 
+def _scalar(data):
+    """PostgREST may return a scalar or a one-item list. Normalize to the value."""
+    if isinstance(data, list):
+        return data[0] if data else None
+    return data
+
+
 def _get_record(email):
     rows = supabase.table(TABLE).select("*").eq("email", email).limit(1).execute().data
     return rows[0] if rows else None
@@ -143,33 +150,28 @@ def _send_code_email(to_email, code):
 
 
 # ── Public API used by request.py ────────────────────────────
-def is_email_verified(email, token):
-    """True only if `token` is the unexpired token issued for `email`."""
+def claim_verification(email, token):
+    """Atomically consume a verified token. Returns True for exactly one caller.
+
+    The conditional UPDATE is a single statement in Postgres, so when two
+    submits race with the same token, only one matches the row.
+    Tradeoff: if the insert fails after the claim, the token is spent and
+    the user must verify again.
+    """
     email = normalize_email(email)
     if not email or not isinstance(token, str) or not token or not _secret():
         return False
     try:
-        rec = _get_record(email)
+        res = (supabase.table(TABLE)
+               .update({"token_hash": None, "token_expires_at": None})
+               .eq("email", email)
+               .eq("token_hash", _digest("token", email, token))
+               .gt("token_expires_at", _now().isoformat())
+               .execute())
     except Exception as e:
-        print(f"[verify] lookup failed: {e}")
+        print(f"[verify] claim failed: {e}")
         return False
-    if not rec or not rec.get("token_hash"):
-        return False
-    expires = _parse_ts(rec.get("token_expires_at"))
-    if not expires or expires <= _now():
-        return False
-    return hmac.compare_digest(rec["token_hash"], _digest("token", email, token))
-
-
-def consume_verification(email):
-    """Invalidates the token so one verification allows exactly one submission."""
-    email = normalize_email(email)
-    if not email:
-        return
-    try:
-        _update_record(email, {"token_hash": None, "token_expires_at": None})
-    except Exception as e:
-        print(f"[verify] consume failed (ignored): {e}")
+    return bool(res.data)
 
 
 # ── Routes ───────────────────────────────────────────────────
@@ -270,17 +272,24 @@ def confirm_code():
     if not expires or expires <= _now():
         return jsonify({"error": "This code has expired. Please request a new one."}), 400
 
-    attempts = int(rec.get("attempts") or 0)
-    if attempts >= MAX_ATTEMPTS:
+    if int(rec.get("attempts") or 0) >= MAX_ATTEMPTS:
         return jsonify({"error": "Too many incorrect attempts. Please request a new code."}), 429
 
-    # Count the attempt before comparing, so parallel guesses cannot skip the limit.
-    attempts += 1
+    # Atomic increment in Postgres: every parallel guess gets its own count,
+    # so the cap holds even when requests arrive at the same time.
     try:
-        _update_record(email, {"attempts": attempts})
+        attempts = _scalar(
+            supabase.rpc("bump_verification_attempts", {"p_email": email}).execute().data
+        )
     except Exception as e:
         print(f"[verify] attempt update failed: {e}")
         return jsonify({"error": "Something went wrong. Please try again."}), 500
+
+    if attempts is None:
+        return jsonify({"error": "No active code for this email. Please request a new one."}), 400
+    attempts = int(attempts)
+    if attempts > MAX_ATTEMPTS:
+        return jsonify({"error": "Too many incorrect attempts. Please request a new code."}), 429
 
     if not hmac.compare_digest(rec["code_hash"], _digest("code", email, code)):
         left = MAX_ATTEMPTS - attempts
