@@ -2,6 +2,7 @@ import base64
 import calendar
 import datetime
 import hmac
+import math
 import os
 import re
 import uuid
@@ -48,7 +49,7 @@ CORS_ORIGINS = list(ALLOWED_ORIGINS)
 if ORIGIN_REGEX:
     CORS_ORIGINS.append(re.compile(ORIGIN_REGEX))
 
-CORS(app, resources={r"/api/*": {"origins": CORS_ORIGINS}})
+CORS(app, resources={r"/api/*": {"origins": CORS_ORIGINS}}, expose_headers=["Retry-After"])
 app.register_blueprint(verification_bp)  # /api/verify/send, /api/verify/confirm
 
 BUCKET = "signatures"
@@ -142,6 +143,13 @@ def too_large(_e):
 @app.errorhandler(429)
 def rate_limit_hit(_e):
     return jsonify({"error": "Too many requests. Please slow down and try again shortly."}), 429
+
+
+@app.after_request
+def ensure_retry_after(response):
+    if response.status_code == 429 and "Retry-After" not in response.headers:
+        response.headers["Retry-After"] = "60"
+    return response
 
 
 # ── Signature handling ───────────────────────────────────────

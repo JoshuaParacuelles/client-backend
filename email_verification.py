@@ -29,7 +29,8 @@ from datetime import datetime, timedelta, timezone
 
 from flask import Blueprint, jsonify, request
 
-from http_utils import client_ip, rate_limited
+from extensions import limiter
+from http_utils import client_ip
 from supabase_client import supabase
 
 TABLE = "email_verification"
@@ -79,6 +80,12 @@ def _parse_ts(value):
 
 def normalize_email(value):
     return value.strip().lower() if isinstance(value, str) else ""
+
+
+def verification_email_key():
+    body = request.get_json(silent=True) or {}
+    email = normalize_email(body.get("email"))
+    return f"email:{email}" if email else f"ip:{client_ip()}"
 
 
 def _digest(purpose, email, value):
@@ -176,6 +183,8 @@ def claim_verification(email, token):
 
 # ── Routes ───────────────────────────────────────────────────
 @verification_bp.post("/send")
+@limiter.limit("10 per hour", key_func=client_ip)
+@limiter.limit("5 per hour", key_func=verification_email_key)
 def send_code():
     body = request.get_json(silent=True) or {}
     email = normalize_email(body.get("email"))
@@ -185,10 +194,6 @@ def send_code():
     if not _is_configured():
         print("[verify] BREVO_API_KEY / MAIL_FROM_EMAIL / VERIFICATION_SECRET is not set")
         return jsonify({"error": "Email verification is temporarily unavailable."}), 503
-
-    if rate_limited(f"verify-send-ip:{client_ip()}", limit=10, window_seconds=3600) or \
-            rate_limited(f"verify-send-email:{email}", limit=5, window_seconds=3600):
-        return jsonify({"error": "Too many code requests. Please try again later."}), 429
 
     try:
         existing = _get_record(email)
@@ -243,10 +248,9 @@ def send_code():
 
 
 @verification_bp.post("/confirm")
+@limiter.limit("30 per 15 minutes", key_func=client_ip)
+@limiter.limit("10 per 15 minutes", key_func=verification_email_key)
 def confirm_code():
-    if rate_limited(f"verify-confirm-ip:{client_ip()}", limit=30, window_seconds=900):
-        return jsonify({"error": "Too many attempts. Please wait a few minutes and try again."}), 429
-
     body = request.get_json(silent=True) or {}
     email = normalize_email(body.get("email"))
     code = body.get("code")
