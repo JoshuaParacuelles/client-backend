@@ -8,13 +8,22 @@ Flow
   3. The submit endpoints call claim_verification(email, token). It atomically
      consumes the token, so one verification allows exactly one submission.
 
+Abuse controls
+  - Cooldown:       one code per RESEND_COOLDOWN_SECONDS per email.
+  - Send cap:       at most CODE_SENDS_PER_WINDOW codes per email per 24 hours.
+                    Stored in the database, so it survives restarts and works
+                    across every server instance.
+  - Guess cap:      MAX_CODE_ATTEMPTS wrong guesses per code, counted atomically in Postgres.
+  - IP limits:      generous, because offices often share one public IP.
+
 Only HMAC hashes of the code and token are stored, never the raw values.
 
 Environment variables
-  BREVO_API_KEY        Brevo API key (starts with xkeysib-)
-  MAIL_FROM_EMAIL      Sender address verified in Brevo (e.g. forcapstone9@gmail.com)
-  VERIFICATION_SECRET  long random string used to hash codes/tokens
-  MAIL_FROM_NAME       optional display name for the sender
+  BREVO_API_KEY         Brevo API key (starts with xkeysib-)
+  MAIL_FROM_EMAIL       Sender address verified in Brevo
+  VERIFICATION_SECRET   long random string used to hash codes/tokens
+  MAIL_FROM_NAME        optional display name for the sender
+  CODE_SENDS_PER_DAY    optional, default 10
 """
 import hashlib
 import hmac
@@ -36,10 +45,12 @@ from supabase_client import supabase
 TABLE = "email_verification"
 
 CODE_LENGTH = 6
-CODE_TTL_SECONDS = 10 * 60        # how long a code is valid
-RESEND_COOLDOWN_SECONDS = 60      # minimum gap between two codes for one email
-MAX_ATTEMPTS = 5                  # wrong guesses allowed per code
-TOKEN_TTL_SECONDS = 30 * 60       # how long a verified email may be used to submit
+CODE_TTL_SECONDS = 10 * 60
+RESEND_COOLDOWN_SECONDS = 60
+MAX_CODE_ATTEMPTS = 5
+CODE_SENDS_PER_WINDOW = int(os.environ.get("CODE_SENDS_PER_DAY", "10"))
+SEND_WINDOW_SECONDS = 24 * 60 * 60
+TOKEN_TTL_SECONDS = 30 * 60
 
 EMAIL_RE = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
 CODE_RE = re.compile(rf"^\d{{{CODE_LENGTH}}}$")
@@ -73,19 +84,13 @@ def _parse_ts(value):
         return None
     try:
         dt = datetime.fromisoformat(value)
-    except ValueError:
+    except (TypeError, ValueError):
         return None
     return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
 
 
 def normalize_email(value):
     return value.strip().lower() if isinstance(value, str) else ""
-
-
-def verification_email_key():
-    body = request.get_json(silent=True) or {}
-    email = normalize_email(body.get("email"))
-    return f"email:{email}" if email else f"ip:{client_ip()}"
 
 
 def _digest(purpose, email, value):
@@ -107,6 +112,22 @@ def _get_record(email):
 
 def _update_record(email, fields):
     supabase.table(TABLE).update(fields).eq("email", email).execute()
+
+
+def _limited(message, retry_after, code):
+    """429 with a JSON body and a Retry-After header, so the frontend can show a clear wait time."""
+    resp = jsonify({"error": message, "code": code, "retry_after": retry_after})
+    resp.status_code = 429
+    resp.headers["Retry-After"] = str(retry_after)
+    return resp
+
+
+def _send_window(rec, now):
+    """Return (window_start, sends_so_far). A new window starts when the old one has expired."""
+    start = _parse_ts(rec.get("send_window_started_at")) if rec else None
+    if not start or now - start >= timedelta(seconds=SEND_WINDOW_SECONDS):
+        return now, 0
+    return start, int(rec.get("send_count") or 0)
 
 
 def _send_code_email(to_email, code):
@@ -152,7 +173,6 @@ def _send_code_email(to_email, code):
         with urllib.request.urlopen(req, timeout=15) as resp:
             resp.read()
     except urllib.error.HTTPError as e:
-        # Include Brevo's explanation so the Render logs show why it failed.
         raise RuntimeError(f"Brevo HTTP {e.code}: {e.read().decode('utf-8', 'replace')}") from e
 
 
@@ -183,8 +203,7 @@ def claim_verification(email, token):
 
 # ── Routes ───────────────────────────────────────────────────
 @verification_bp.post("/send")
-@limiter.limit("10 per hour", key_func=client_ip)
-@limiter.limit("5 per hour", key_func=verification_email_key)
+@limiter.limit("100 per hour", key_func=client_ip)
 def send_code():
     body = request.get_json(silent=True) or {}
     email = normalize_email(body.get("email"))
@@ -196,24 +215,31 @@ def send_code():
         return jsonify({"error": "Email verification is temporarily unavailable."}), 503
 
     try:
-        existing = _get_record(email)
+        prev = _get_record(email) or {}
     except Exception as e:
         print(f"[verify] lookup failed: {e}")
         return jsonify({"error": "Something went wrong. Please try again."}), 500
 
-    if existing:
-        last_sent = _parse_ts(existing.get("last_sent_at"))
-        if last_sent:
-            wait = RESEND_COOLDOWN_SECONDS - (_now() - last_sent).total_seconds()
-            if wait > 0:
-                retry_after = math.ceil(wait)
-                return jsonify({
-                    "error": f"Please wait {retry_after} seconds before requesting another code.",
-                    "retry_after": retry_after,
-                }), 429
+    now = _now()
+
+    # 1. Cooldown between two codes for the same email.
+    last_sent = _parse_ts(prev.get("last_sent_at"))
+    if last_sent:
+        wait = RESEND_COOLDOWN_SECONDS - (now - last_sent).total_seconds()
+        if wait > 0:
+            seconds = math.ceil(wait)
+            return _limited(f"Please wait {seconds} seconds before requesting another code.",
+                            seconds, "COOLDOWN")
+
+    # 2. Daily cap per email.
+    window_start, sent_so_far = _send_window(prev, now)
+    if sent_so_far >= CODE_SENDS_PER_WINDOW:
+        reset_at = window_start + timedelta(seconds=SEND_WINDOW_SECONDS)
+        seconds = max(1, math.ceil((reset_at - now).total_seconds()))
+        return _limited("This email has reached today's limit for verification codes.",
+                        seconds, "SEND_LIMIT")
 
     code = f"{secrets.randbelow(10 ** CODE_LENGTH):0{CODE_LENGTH}d}"
-    now = _now()
     try:
         supabase.table(TABLE).upsert({
             "email": email,
@@ -221,6 +247,8 @@ def send_code():
             "expires_at": (now + timedelta(seconds=CODE_TTL_SECONDS)).isoformat(),
             "attempts": 0,
             "last_sent_at": now.isoformat(),
+            "send_count": sent_so_far + 1,
+            "send_window_started_at": window_start.isoformat(),
             "token_hash": None,
             "token_expires_at": None,
             "verified_at": None,
@@ -233,23 +261,29 @@ def send_code():
         _send_code_email(email, code)
     except Exception as e:
         print(f"[verify] email send failed: {e}")
-        # Drop the unsent code so the cooldown does not block an immediate retry.
+        # The email never left. Undo this attempt so it does not use up the cooldown or the daily cap.
         try:
-            supabase.table(TABLE).delete().eq("email", email).execute()
+            _update_record(email, {
+                "code_hash": None,
+                "expires_at": None,
+                "last_sent_at": prev.get("last_sent_at"),
+                "send_count": sent_so_far,
+                "send_window_started_at": window_start.isoformat(),
+            })
         except Exception as e2:
-            print(f"[verify] cleanup failed: {e2}")
+            print(f"[verify] rollback failed: {e2}")
         return jsonify({"error": "We couldn't send the verification email. Please try again in a moment."}), 502
 
     return jsonify({
         "ok": True,
         "expires_in": CODE_TTL_SECONDS,
         "resend_in": RESEND_COOLDOWN_SECONDS,
+        "sends_left": CODE_SENDS_PER_WINDOW - (sent_so_far + 1),
     })
 
 
 @verification_bp.post("/confirm")
-@limiter.limit("30 per 15 minutes", key_func=client_ip)
-@limiter.limit("10 per 15 minutes", key_func=verification_email_key)
+@limiter.limit("100 per 15 minutes", key_func=client_ip)
 def confirm_code():
     body = request.get_json(silent=True) or {}
     email = normalize_email(body.get("email"))
@@ -276,11 +310,10 @@ def confirm_code():
     if not expires or expires <= _now():
         return jsonify({"error": "This code has expired. Please request a new one."}), 400
 
-    if int(rec.get("attempts") or 0) >= MAX_ATTEMPTS:
+    if int(rec.get("attempts") or 0) >= MAX_CODE_ATTEMPTS:
         return jsonify({"error": "Too many incorrect attempts. Please request a new code."}), 429
 
-    # Atomic increment in Postgres: every parallel guess gets its own count,
-    # so the cap holds even when requests arrive at the same time.
+    # Atomic increment in Postgres, so parallel guesses cannot bypass the cap.
     try:
         attempts = _scalar(
             supabase.rpc("bump_verification_attempts", {"p_email": email}).execute().data
@@ -292,11 +325,11 @@ def confirm_code():
     if attempts is None:
         return jsonify({"error": "No active code for this email. Please request a new one."}), 400
     attempts = int(attempts)
-    if attempts > MAX_ATTEMPTS:
+    if attempts > MAX_CODE_ATTEMPTS:
         return jsonify({"error": "Too many incorrect attempts. Please request a new code."}), 429
 
-    if not hmac.compare_digest(rec["code_hash"], _digest("code", email, code)):
-        left = MAX_ATTEMPTS - attempts
+    if not hmac.compare_digest(rec["code_hash"].encode("utf-8"), _digest("code", email, code).encode("utf-8")):
+        left = MAX_CODE_ATTEMPTS - attempts
         if left <= 0:
             return jsonify({"error": "Too many incorrect attempts. Please request a new code."}), 429
         return jsonify({"error": f"Incorrect code. {left} attempt{'s' if left != 1 else ''} left."}), 400
