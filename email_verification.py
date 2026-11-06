@@ -52,6 +52,12 @@ CODE_SENDS_PER_WINDOW = int(os.environ.get("CODE_SENDS_PER_DAY", "10"))
 SEND_WINDOW_SECONDS = 24 * 60 * 60
 TOKEN_TTL_SECONDS = 30 * 60
 
+# Public site where the frontend (and its /public logos) is hosted.
+# Email clients load images from this URL, so it must be the live site.
+PUBLIC_SITE_URL = os.environ.get("PUBLIC_SITE_URL", "https://request-slip.online").rstrip("/")
+LCR_LOGO_URL = f"{PUBLIC_SITE_URL}/lcr.jpg"
+SCC_SEAL_URL = f"{PUBLIC_SITE_URL}/scc.png"
+
 EMAIL_RE = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
 CODE_RE = re.compile(rf"^\d{{{CODE_LENGTH}}}$")
 
@@ -135,15 +141,32 @@ def _send_code_email(to_email, code):
     minutes = CODE_TTL_SECONDS // 60
 
     text = (
+        "Local Civil Registrar - San Carlos City\n\n"
         f"Your verification code is: {code}\n\n"
         f"It expires in {minutes} minutes. Enter it on the request form to confirm your email address.\n\n"
         "If you did not request this code, you can safely ignore this email."
     )
     html = f"""\
-<div style="font-family:Arial,sans-serif;max-width:420px;margin:0 auto;padding:24px;color:#0f1f3d;">
-  <h2 style="margin:0 0 12px;font-size:18px;">Local Civil Registrar</h2>
-  <p style="margin:0 0 16px;font-size:14px;">Use this code to confirm your email address:</p>
-  <p style="margin:0 0 16px;font-size:32px;font-weight:700;letter-spacing:8px;">{code}</p>
+<div style="font-family:Arial,Helvetica,sans-serif;max-width:460px;margin:0 auto;padding:24px;
+            color:#0f1f3d;background:#ffffff;border:1px solid #dde6f2;border-radius:12px;">
+  <table role="presentation" cellpadding="0" cellspacing="0" border="0" align="center" style="margin:0 auto 16px;">
+    <tr>
+      <td style="vertical-align:middle;padding-right:12px;">
+        <img src="{LCR_LOGO_URL}" alt="Office of the City Civil Registrar" width="56" height="56"
+             style="display:block;width:56px;height:auto;border:0;outline:none;text-decoration:none;">
+      </td>
+      <td style="vertical-align:middle;padding-left:12px;border-left:1px solid #dde6f2;">
+        <img src="{SCC_SEAL_URL}" alt="City of San Carlos seal" width="48" height="48"
+             style="display:block;width:48px;height:auto;border:0;outline:none;text-decoration:none;">
+      </td>
+    </tr>
+  </table>
+
+  <h2 style="margin:0;font-size:18px;text-align:center;color:#0f1f3d;">Local Civil Registrar</h2>
+  <p style="margin:4px 0 20px;font-size:12px;text-align:center;color:#6b87a8;">San Carlos City, Negros Occidental</p>
+
+  <p style="margin:0 0 12px;font-size:14px;color:#0f1f3d;">Use this code to confirm your email address:</p>
+  <p style="margin:0 0 16px;font-size:32px;font-weight:700;letter-spacing:8px;text-align:center;color:#0c447c;">{code}</p>
   <p style="margin:0 0 8px;font-size:13px;color:#5577a0;">It expires in {minutes} minutes.</p>
   <p style="margin:0;font-size:13px;color:#5577a0;">If you did not request this code, you can safely ignore this email.</p>
 </div>"""
