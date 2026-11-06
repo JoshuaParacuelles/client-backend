@@ -1,4 +1,8 @@
 import os
+from dotenv import load_dotenv
+
+load_dotenv()  # load environment before initializing the Supabase client
+
 from supabase import create_client, Client
 
 url = os.environ.get("SUPABASE_URL")
