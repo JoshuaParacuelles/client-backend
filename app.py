@@ -6,20 +6,20 @@ from flask import Flask, jsonify
 from flask_cors import CORS
 from werkzeug.middleware.proxy_fix import ProxyFix
 
-from config import CORS_ORIGINS, DEBUG, MAX_SIG_BYTES
+from config import CORS_ORIGINS, DEBUG, MAX_FEEDBACK_FILE_BYTES
 from extensions import limiter
 
 app = Flask(__name__)
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1)  # one proxy hop (Render)
 limiter.init_app(app)
-app.config["MAX_CONTENT_LENGTH"] = MAX_SIG_BYTES + 512 * 1024
+app.config["MAX_CONTENT_LENGTH"] = 2 * MAX_FEEDBACK_FILE_BYTES + 512 * 1024
 
 CORS(app, resources={r"/api/*": {"origins": CORS_ORIGINS}}, expose_headers=["Retry-After"])
 
 
 @app.errorhandler(413)
 def too_large(_e):
-    return jsonify({"error": "Upload is too large. The signature file must be 2 MB or smaller."}), 413
+    return jsonify({"error": "The request or one of its files is too large."}), 413
 
 
 @app.errorhandler(429)
@@ -36,11 +36,13 @@ def ensure_retry_after(response):
 
 from email_verification import verification_bp
 from routes.admin import admin_bp
+from routes.feedback import feedback_bp
 from routes.requests import requests_bp
 
 app.register_blueprint(verification_bp)  # /api/verify/send, /api/verify/confirm
 app.register_blueprint(requests_bp)
 app.register_blueprint(admin_bp)
+app.register_blueprint(feedback_bp)
 
 
 if __name__ == "__main__":

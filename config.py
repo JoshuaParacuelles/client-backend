@@ -3,6 +3,7 @@ import re
 
 BUCKET = "signatures"
 MAX_SIG_BYTES = 2 * 1024 * 1024
+MAX_FEEDBACK_FILE_BYTES = 5 * 1024 * 1024
 EXT = {"image/png": "png", "image/jpeg": "jpg", "image/webp": "webp", "application/pdf": "pdf"}
 MIME = {v: k for k, v in EXT.items()}
 
