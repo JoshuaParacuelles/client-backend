@@ -16,12 +16,14 @@ ALLOWED_TYPES = {
     "Feature Suggestion",
     "General Feedback",
     "Content Error",
+    "Other Issue",
 }
 ALLOWED_IMAGES = {
     "image/png": ("png", b"\x89PNG\r\n\x1a\n"),
     "image/jpeg": ("jpg", b"\xff\xd8\xff"),
 }
 MAX_DESCRIPTION_CHARS = 500
+MAX_OTHER_TYPE_CHARS = 100
 STORAGE_BUCKET = "signatures"
 
 
@@ -80,9 +82,19 @@ def _remove_uploaded_files(paths):
 @limiter.limit("5 per minute; 20 per hour")
 def submit_feedback():
     issue_type = (request.form.get("issue_type") or "").strip()
+    other_issue_type = (request.form.get("other_issue_type") or "").strip()
     description = (request.form.get("description") or "").strip()
     if issue_type not in ALLOWED_TYPES:
         return jsonify(error="Invalid issue type."), 400
+    if issue_type == "Other Issue":
+        if not other_issue_type:
+            return jsonify(error="Please specify the issue type."), 400
+        if len(other_issue_type) > MAX_OTHER_TYPE_CHARS:
+            return jsonify(
+                error=f"The issue type must be {MAX_OTHER_TYPE_CHARS} characters or fewer."
+            ), 400
+    else:
+        other_issue_type = None
     if not description or len(description) > MAX_DESCRIPTION_CHARS:
         return jsonify(
             error=f"Description is required and must be {MAX_DESCRIPTION_CHARS} characters or fewer."
@@ -117,6 +129,7 @@ def submit_feedback():
         supabase.table("feedback_reports").insert({
             "id": report_id,
             "issue_type": issue_type,
+            "other_issue_type": other_issue_type,
             "description": description,
             "page_url": _safe_page_url(request.form.get("page_url") or ""),
             "user_agent": user_agent,
