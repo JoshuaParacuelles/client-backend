@@ -10,7 +10,6 @@ from config import (
     COMMON,
     KINDS,
     REQUIRED_TABLES,
-    REQUEST_TABLE,
     STATUS_LABELS,
     STATUS_ORDER,
 )
@@ -27,6 +26,37 @@ from supabase_client import supabase
 from validators import clean, get_incoming_fields, validate_dates, validate_lengths, validate_row
 
 requests_bp = Blueprint("requests", __name__)
+
+TRACK_SELECT = (
+    "id, control_no, status, created_at, updated_at, num_copies, requester_email, "
+    "child_firstname, child_surname, deceased_firstname, deceased_surname, "
+    "husband_fullname, wife_maiden_name"
+)
+
+PREFIX_TO_KIND = {cfg["prefix"].upper(): kind for kind, cfg in KINDS.items()}
+
+
+def find_request(control_no):
+    """Return (row, kind) for a control number, searching the right table first."""
+    prefix = control_no.split("-", 1)[0]
+    kinds = [PREFIX_TO_KIND[prefix]] if prefix in PREFIX_TO_KIND else list(KINDS)
+
+    for kind in kinds:
+        try:
+            rows = (
+                supabase.table(KINDS[kind]["table"])
+                .select(TRACK_SELECT)
+                .eq("control_no", control_no)
+                .limit(1)
+                .execute()
+                .data
+            )
+        except Exception as e:
+            print(f"[request] track lookup failed on {kind}: {e}")
+            continue
+        if rows:
+            return rows[0], kind
+    return None, None
 
 
 def gen_control(prefix, record_id):
@@ -169,26 +199,13 @@ def track_request():
 
     not_found = (jsonify({"error": "No request matches that control number and email."}), 404)
 
-    try:
-        rows = supabase.table(REQUEST_TABLE).select(
-            "id, record_type, control_no, status, created_at, updated_at, "
-            "num_copies, requester_email, "
-            "child_firstname, child_surname, "
-            "deceased_firstname, deceased_surname, "
-            "husband_fullname, wife_maiden_name"
-        ).eq("control_no", control_no).limit(1).execute().data
-    except Exception as e:
-        print(f"[request] track failed: {e}")
-        return jsonify({"error": "Something went wrong. Please try again."}), 500
-
-    row = rows[0] if rows else None
+    row, kind = find_request(control_no)
     stored = ((row or {}).get("requester_email") or "").strip().lower()
     # Same response whether the number or the email is wrong (no enumeration).
     # Bytes compare: str compare_digest raises on non-ASCII input.
     if not row or not stored or not hmac.compare_digest(stored.encode("utf-8"), email.encode("utf-8")):
         return not_found
 
-    kind = (row.get("record_type") or "birth").lower()
     status = (row.get("status") or "PENDING").upper()
     return jsonify({
         "control_no": row.get("control_no"),
