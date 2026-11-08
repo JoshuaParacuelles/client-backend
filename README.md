@@ -25,7 +25,7 @@ This folder contains the Flask backend for requests, email verification, feedbac
 ## Dependencies
 `app.py` registers email verification and route blueprints. The route files use helpers from config, validation, signatures, notifications, rate limits, and Supabase.
 
-Run the feedback table and row-level-security statements in `../sql.sql` before enabling feedback submissions. The route uses the existing private `signatures` storage bucket under `feedback/`; the Flask service role performs all writes. Configure `RATELIMIT_STORAGE_URI` with shared Redis in multi-worker or multi-instance deployments so feedback limits are shared.
+Run the feedback table, `issue_subtype` column, and private `feedback-attachments` bucket statements in `../sql.sql` before enabling feedback submissions. Pillow verifies feedback images before upload. The Flask service role performs all writes. Configure `RATELIMIT_STORAGE_URI` with shared Redis in multi-worker or multi-instance deployments so feedback limits are shared.
 
 ## Notes
 `request.py.bak` contains older code that overlaps with the current separate modules; it is marked as a backup. Python creates `__pycache__/` automatically, and it does not need to be tracked in Git.
