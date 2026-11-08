@@ -10,9 +10,6 @@ Flow
 
 Abuse controls
   - Cooldown:       one code per RESEND_COOLDOWN_SECONDS per email.
-  - Send cap:       at most CODE_SENDS_PER_WINDOW codes per email per 24 hours.
-                    Stored in the database, so it survives restarts and works
-                    across every server instance.
   - Guess cap:      MAX_CODE_ATTEMPTS wrong guesses per code, counted atomically in Postgres.
   - IP limits:      generous, because offices often share one public IP.
 
@@ -23,7 +20,6 @@ Environment variables
   MAIL_FROM_EMAIL       Sender address verified in Brevo
   VERIFICATION_SECRET   long random string used to hash codes/tokens
   MAIL_FROM_NAME        optional display name for the sender
-  CODE_SENDS_PER_DAY    optional, default 10
 """
 import hashlib
 import hmac
@@ -48,8 +44,6 @@ CODE_LENGTH = 6
 CODE_TTL_SECONDS = 10 * 60
 RESEND_COOLDOWN_SECONDS = 60
 MAX_CODE_ATTEMPTS = 5
-CODE_SENDS_PER_WINDOW = int(os.environ.get("CODE_SENDS_PER_DAY", "10"))
-SEND_WINDOW_SECONDS = 24 * 60 * 60
 TOKEN_TTL_SECONDS = 30 * 60
 
 # Public site where the frontend (and its /public logos) is hosted.
@@ -126,14 +120,6 @@ def _limited(message, retry_after, code):
     resp.status_code = 429
     resp.headers["Retry-After"] = str(retry_after)
     return resp
-
-
-def _send_window(rec, now):
-    """Return (window_start, sends_so_far). A new window starts when the old one has expired."""
-    start = _parse_ts(rec.get("send_window_started_at")) if rec else None
-    if not start or now - start >= timedelta(seconds=SEND_WINDOW_SECONDS):
-        return now, 0
-    return start, int(rec.get("send_count") or 0)
 
 
 def _send_code_email(to_email, code):
@@ -254,14 +240,6 @@ def send_code():
             return _limited(f"Please wait {seconds} seconds before requesting another code.",
                             seconds, "COOLDOWN")
 
-    # 2. Daily cap per email.
-    window_start, sent_so_far = _send_window(prev, now)
-    if sent_so_far >= CODE_SENDS_PER_WINDOW:
-        reset_at = window_start + timedelta(seconds=SEND_WINDOW_SECONDS)
-        seconds = max(1, math.ceil((reset_at - now).total_seconds()))
-        return _limited("This email has reached today's limit for verification codes.",
-                        seconds, "SEND_LIMIT")
-
     code = f"{secrets.randbelow(10 ** CODE_LENGTH):0{CODE_LENGTH}d}"
     try:
         supabase.table(TABLE).upsert({
@@ -270,8 +248,6 @@ def send_code():
             "expires_at": (now + timedelta(seconds=CODE_TTL_SECONDS)).isoformat(),
             "attempts": 0,
             "last_sent_at": now.isoformat(),
-            "send_count": sent_so_far + 1,
-            "send_window_started_at": window_start.isoformat(),
             "token_hash": None,
             "token_expires_at": None,
             "verified_at": None,
@@ -284,14 +260,12 @@ def send_code():
         _send_code_email(email, code)
     except Exception as e:
         print(f"[verify] email send failed: {e}")
-        # The email never left. Undo this attempt so it does not use up the cooldown or the daily cap.
+        # The email never left, so restore the previous cooldown timestamp.
         try:
             _update_record(email, {
                 "code_hash": None,
                 "expires_at": None,
                 "last_sent_at": prev.get("last_sent_at"),
-                "send_count": sent_so_far,
-                "send_window_started_at": window_start.isoformat(),
             })
         except Exception as e2:
             print(f"[verify] rollback failed: {e2}")
@@ -301,7 +275,6 @@ def send_code():
         "ok": True,
         "expires_in": CODE_TTL_SECONDS,
         "resend_in": RESEND_COOLDOWN_SECONDS,
-        "sends_left": CODE_SENDS_PER_WINDOW - (sent_so_far + 1),
     })
 
 
